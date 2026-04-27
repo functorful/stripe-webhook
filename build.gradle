@@ -1,0 +1,242 @@
+plugins {
+    id("io.micronaut.application") version "4.6.1"
+    id("io.micronaut.aot") version "4.6.1"
+    id("com.gradleup.shadow") version "8.3.9"
+}
+
+version = file('version.txt').getText("utf8").trim()
+group = "com.functorful.stripewebhook"
+
+def executeCommand(command) {
+    def result = command.execute([], projectDir)
+    result.waitFor()
+    return result.text.trim()
+}
+
+def findGitSha() {
+    return executeCommand('git rev-parse --short HEAD')
+}
+
+def findGitBranch() {
+    return executeCommand('git rev-parse --abbrev-ref HEAD')
+}
+
+def findGitTag() {
+    return executeCommand('git describe --exact-match --tags')
+}
+
+def gitSha = findGitSha()
+def gitBranch = findGitBranch()
+def gitTag = findGitTag()
+// In CI the runner checks out a commit; CI_COMMIT_REF_NAME (GitLab) or GITHUB_REF_NAME (GitHub) provides the ref.
+def ciRefName = System.getenv('GITHUB_REF_NAME') ?: System.getenv('CI_COMMIT_REF_NAME')
+
+def tagMatcher = ciRefName =~ /^v(\d+\.\d+\.\d+)$/
+def isTag = tagMatcher.matches()
+
+def dockerImageTag = isTag ? "v$project.version" : "rc$project.version-$gitSha"
+def dockerImage = "449463292843.dkr.ecr.eu-west-1.amazonaws.com/stripe-webhook:$dockerImageTag"
+
+println("Version       ==> $project.version")
+println("Git branch    ==> $gitBranch")
+println("Git tag       ==> $gitTag")
+println("Git SHA       ==> $gitSha")
+println("CI ref        ==> $ciRefName")
+println("Docker image  ==> $dockerImage")
+
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    annotationProcessor("org.projectlombok:lombok")
+    annotationProcessor("io.micronaut.serde:micronaut-serde-processor")
+    annotationProcessor("io.micronaut.validation:micronaut-validation-processor")
+    annotationProcessor("io.micronaut.tracing:micronaut-tracing-opentelemetry-annotation:7.2.0")
+
+    implementation("com.amazonaws:aws-lambda-java-events")
+    implementation("io.micronaut:micronaut-http-client-jdk")
+    implementation("io.micronaut.aws:micronaut-aws-lambda-events-serde")
+    implementation("io.micronaut.aws:micronaut-aws-sdk-v2")
+    implementation("io.micronaut.aws:micronaut-function-aws")
+    implementation("io.micronaut.aws:micronaut-function-aws-custom-runtime")
+    implementation("io.micronaut.serde:micronaut-serde-jackson")
+    implementation("io.micronaut.validation:micronaut-validation")
+    implementation("jakarta.validation:jakarta.validation-api")
+    implementation("software.amazon.awssdk:dynamodb-enhanced") {
+        exclude(group: "software.amazon.awssdk", module: "apache-client")
+        exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
+    }
+    implementation("software.amazon.awssdk:url-connection-client")
+
+    implementation("io.vavr:vavr:0.11.0")
+
+    implementation("io.micronaut.tracing:micronaut-tracing-opentelemetry:7.2.0")
+    implementation("io.opentelemetry.instrumentation:opentelemetry-aws-sdk-2.2")
+
+
+    compileOnly("org.projectlombok:lombok")
+
+    runtimeOnly("ch.qos.logback:logback-classic")
+    runtimeOnly("org.yaml:snakeyaml")
+
+    testImplementation("org.junit.jupiter:junit-jupiter-params")
+    testImplementation("org.mockito:mockito-core")
+    testImplementation("org.mockito:mockito-junit-jupiter")
+    testImplementation("org.assertj:assertj-core:3.27.7")
+    testImplementation("org.assertj:assertj-vavr:0.4.3")
+    testImplementation("software.amazon.awssdk:sts")
+}
+
+
+application {
+    mainClass = "com.functorful.stripewebhook.FunctionLambdaRuntime"
+}
+
+java {
+    sourceCompatibility = JavaVersion.toVersion("21")
+    targetCompatibility = JavaVersion.toVersion("21")
+}
+
+
+micronaut {
+    runtime("lambda_java")
+    testRuntime("junit5")
+    processing {
+        incremental(true)
+        annotations("com.functorful.stripewebhook.*")
+    }
+    aot {
+        // Please review carefully the optimizations enabled below
+        // Check https://micronaut-projects.github.io/micronaut-aot/latest/guide/ for more details
+        optimizeServiceLoading = true
+        convertYamlToJava = true
+        precomputeOperations = true
+        cacheEnvironment = true
+        optimizeClassLoading = true
+        deduceEnvironment = true
+        optimizeNetty = true
+        replaceLogbackXml = true
+        netty {
+            enabled = true
+        }
+    }
+}
+
+graalvmNative {
+    binaries {
+        main {
+            buildArgs.addAll(
+                    "--initialize-at-build-time=ch.qos.logback",
+                    "-H:+ReportExceptionStackTraces",
+                    "-J-javaagent:/home/app/dd-java-agent.jar",
+                    "-Ddd.trace.otel.enabled=true",
+                    "-Ddd.logs.injection=true"
+            )
+        }
+    }
+    toolchainDetection = false
+}
+
+private LinkedHashMap<String, String> dockerEnv() {
+    [
+            AWS_LAMBDA_EXEC_WRAPPER: "/opt/datadog_wrapper",
+            DD_SITE                : "datadoghq.eu",
+            DD_SERVICE             : "stripe-webhook",
+            DD_TRACE_OTEL_ENABLED  : "true",
+            DD_LOGS_INJECTION      : "true",
+            DD_VERSION             : version.toString(),
+    ]
+}
+
+// JVM Docker image — retained for local development or fallback
+tasks.register('copyDatadogAgent', Copy) {
+    from "datadog/dd-java-agent.jar"
+    into "${dockerfile.getDestDir().get()}"
+}
+
+dockerfile {
+    dependsOn tasks.copyDatadogAgent
+
+    // Dockerfile instructions that are set on the final image
+    environmentVariable(dockerEnv())
+    copyFile("dd-java-agent.jar", "/home/app/")
+
+    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+    entryPoint("java", "-javaagent:/home/app/dd-java-agent.jar", "-jar", "/home/app/application.jar")
+}
+
+tasks.register('copyDatadogAgentNative', Copy) {
+    from "datadog/dd-java-agent.jar"
+    into "${dockerfileNative.getDestDir().get()}"
+}
+
+dockerfileNative {
+    dependsOn tasks.copyDatadogAgentNative
+
+    // Dockerfile instructions that are set on the final image
+    environmentVariable(dockerEnv())
+    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+}
+
+tasks.named("dockerfileNative") {
+    editDockerfile {
+        def originalInstructions = new ArrayList(instructions.get())
+        int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
+        def instruction = originalInstructions.get(runIndex)
+        before(instruction.text) {
+            // Insert the copy instruction before the "RUN native-image ..." instruction that uses it
+            insert("COPY --link dd-java-agent.jar /home/app/")
+        }
+    }
+}
+
+tasks.register('copyDatadogAgentOptimizedNative', Copy) {
+    from "datadog/dd-java-agent.jar"
+    into "${optimizedDockerfileNative.getDestDir().get()}"
+}
+
+optimizedDockerfileNative {
+    dependsOn tasks.copyDatadogAgentOptimizedNative
+
+    // Dockerfile instructions that are set on the final image
+    environmentVariable(dockerEnv())
+    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+}
+
+tasks.named("optimizedDockerfileNative") {
+    editDockerfile {
+        def originalInstructions = new ArrayList(instructions.get())
+        int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
+        def instruction = originalInstructions.get(runIndex)
+        before(instruction.text) {
+            // Insert the copy instruction before the "RUN native-image ..." instruction that uses it
+            insert("COPY --link dd-java-agent.jar /home/app/")
+        }
+    }
+}
+
+tasks.named("dockerBuild") {
+    images = [dockerImage]
+}
+
+tasks.named("dockerBuildNative") {
+    images = [dockerImage]
+}
+
+tasks.named("optimizedDockerBuild") {
+    images = [dockerImage]
+}
+
+tasks.named("optimizedDockerBuildNative") {
+    images = [dockerImage]
+}
+
+optimizedBuildLayers {
+    dependsOn tasks.optimizedRunnerNativeJar
+}
+
+optimizedBuildNativeLayersTask {
+    dependsOn tasks.optimizedRunnerJitJar
+}

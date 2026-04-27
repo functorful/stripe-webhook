@@ -1,0 +1,6 @@
+applicationType: function
+defaultPackage: com.functorful.stripewebhook
+testFramework: junit
+sourceLanguage: java
+buildTool: gradle
+features: [app-name, aws-lambda, aws-lambda-custom-runtime, aws-lambda-events-serde, aws-lambda-handler-function, aws-v2-sdk, dynamodb, graalvm, gradle, http-client-jdk, http-client-test, java, junit, junit-params, logback, lombok, micronaut-build, properties, readme, serialization-jackson, shade, validation, x86]
