@@ -4,45 +4,26 @@ plugins {
     id("com.gradleup.shadow") version "8.3.9"
 }
 
-version = file('version.txt').getText("utf8").trim()
+def isDatadogBuild = gradle.startParameter.taskNames.any { taskName ->
+    taskName.endsWith("Datadog")
+}
+
+version = providers.exec {
+    commandLine("sh", "-c", "git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0-SNAPSHOT")
+}.standardOutput.asText.map { it.trim().replaceFirst("^v", "") }.get()
 group = "com.functorful.stripewebhook"
 
-def executeCommand(command) {
-    def result = command.execute([], projectDir)
-    result.waitFor()
-    return result.text.trim()
-}
+def gitSha = providers.exec { commandLine("git", "rev-parse", "--short", "HEAD") }
+        .standardOutput.asText.map { it.trim() }
 
-def findGitSha() {
-    return executeCommand('git rev-parse --short HEAD')
-}
+def dockerImageTag = providers.environmentVariable("DOCKER_IMAGE_TAG")
+        .orElse(gitSha.map { sha -> "dev-$sha" })
+        .map { tag -> isDatadogBuild ? "$tag-dd" : tag }
 
-def findGitBranch() {
-    return executeCommand('git rev-parse --abbrev-ref HEAD')
-}
+def dockerImageRepo = providers.environmentVariable("DOCKER_IMAGE_REPO")
+        .orElse("ghcr.io/functorful/stripe-webhook")
 
-def findGitTag() {
-    return executeCommand('git describe --exact-match --tags')
-}
-
-def gitSha = findGitSha()
-def gitBranch = findGitBranch()
-def gitTag = findGitTag()
-// In CI the runner checks out a commit; CI_COMMIT_REF_NAME (GitLab) or GITHUB_REF_NAME (GitHub) provides the ref.
-def ciRefName = System.getenv('GITHUB_REF_NAME') ?: System.getenv('CI_COMMIT_REF_NAME')
-
-def tagMatcher = ciRefName =~ /^v(\d+\.\d+\.\d+)$/
-def isTag = tagMatcher.matches()
-
-def dockerImageTag = isTag ? "v$project.version" : "rc$project.version-$gitSha"
-def dockerImage = "449463292843.dkr.ecr.eu-west-1.amazonaws.com/stripe-webhook:$dockerImageTag"
-
-println("Version       ==> $project.version")
-println("Git branch    ==> $gitBranch")
-println("Git tag       ==> $gitTag")
-println("Git SHA       ==> $gitSha")
-println("CI ref        ==> $ciRefName")
-println("Docker image  ==> $dockerImage")
+def dockerImage = dockerImageRepo.zip(dockerImageTag) { repo, tag -> "$repo:$tag" }
 
 
 repositories {
@@ -129,11 +110,15 @@ graalvmNative {
         main {
             buildArgs.addAll(
                     "--initialize-at-build-time=ch.qos.logback",
-                    "-H:+ReportExceptionStackTraces",
-                    "-J-javaagent:/home/app/dd-java-agent.jar",
-                    "-Ddd.trace.otel.enabled=true",
-                    "-Ddd.logs.injection=true"
+                    "-H:+ReportExceptionStackTraces"
             )
+            if (isDatadogBuild) {
+                buildArgs.addAll(
+                        "-J-javaagent:/home/app/dd-java-agent.jar",
+                        "-Ddd.trace.otel.enabled=true",
+                        "-Ddd.logs.injection=true"
+                )
+            }
         }
     }
     toolchainDetection = false
@@ -150,87 +135,84 @@ private LinkedHashMap<String, String> dockerEnv() {
     ]
 }
 
-// JVM Docker image — retained for local development or fallback
-tasks.register('copyDatadogAgent', Copy) {
-    from "datadog/dd-java-agent.jar"
-    into "${dockerfile.getDestDir().get()}"
-}
+if (isDatadogBuild) {
+    // JVM Docker image — retained for local development or fallback
+    tasks.register('copyDatadogAgent', Copy) {
+        from "datadog/dd-java-agent.jar"
+        into "${dockerfile.getDestDir().get()}"
+    }
 
-dockerfile {
-    dependsOn tasks.copyDatadogAgent
+    dockerfile {
+        dependsOn tasks.copyDatadogAgent
 
-    // Dockerfile instructions that are set on the final image
-    environmentVariable(dockerEnv())
-    copyFile("dd-java-agent.jar", "/home/app/")
+        environmentVariable(dockerEnv())
+        copyFile("dd-java-agent.jar", "/home/app/")
 
-    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
-    entryPoint("java", "-javaagent:/home/app/dd-java-agent.jar", "-jar", "/home/app/application.jar")
-}
+        instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+        entryPoint("java", "-javaagent:/home/app/dd-java-agent.jar", "-jar", "/home/app/application.jar")
+    }
 
-tasks.register('copyDatadogAgentNative', Copy) {
-    from "datadog/dd-java-agent.jar"
-    into "${dockerfileNative.getDestDir().get()}"
-}
+    tasks.register('copyDatadogAgentNative', Copy) {
+        from "datadog/dd-java-agent.jar"
+        into "${dockerfileNative.getDestDir().get()}"
+    }
 
-dockerfileNative {
-    dependsOn tasks.copyDatadogAgentNative
+    dockerfileNative {
+        dependsOn tasks.copyDatadogAgentNative
 
-    // Dockerfile instructions that are set on the final image
-    environmentVariable(dockerEnv())
-    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
-}
+        environmentVariable(dockerEnv())
+        instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+    }
 
-tasks.named("dockerfileNative") {
-    editDockerfile {
-        def originalInstructions = new ArrayList(instructions.get())
-        int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
-        def instruction = originalInstructions.get(runIndex)
-        before(instruction.text) {
-            // Insert the copy instruction before the "RUN native-image ..." instruction that uses it
-            insert("COPY --link dd-java-agent.jar /home/app/")
+    tasks.named("dockerfileNative") {
+        editDockerfile {
+            def originalInstructions = new ArrayList(instructions.get())
+            int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
+            def instruction = originalInstructions.get(runIndex)
+            before(instruction.text) {
+                insert("COPY --link dd-java-agent.jar /home/app/")
+            }
         }
     }
-}
 
-tasks.register('copyDatadogAgentOptimizedNative', Copy) {
-    from "datadog/dd-java-agent.jar"
-    into "${optimizedDockerfileNative.getDestDir().get()}"
-}
+    tasks.register('copyDatadogAgentOptimizedNative', Copy) {
+        from "datadog/dd-java-agent.jar"
+        into "${optimizedDockerfileNative.getDestDir().get()}"
+    }
 
-optimizedDockerfileNative {
-    dependsOn tasks.copyDatadogAgentOptimizedNative
+    optimizedDockerfileNative {
+        dependsOn tasks.copyDatadogAgentOptimizedNative
 
-    // Dockerfile instructions that are set on the final image
-    environmentVariable(dockerEnv())
-    instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
-}
+        environmentVariable(dockerEnv())
+        instruction("COPY --from=public.ecr.aws/datadog/lambda-extension:92 /opt/. /opt/")
+    }
 
-tasks.named("optimizedDockerfileNative") {
-    editDockerfile {
-        def originalInstructions = new ArrayList(instructions.get())
-        int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
-        def instruction = originalInstructions.get(runIndex)
-        before(instruction.text) {
-            // Insert the copy instruction before the "RUN native-image ..." instruction that uses it
-            insert("COPY --link dd-java-agent.jar /home/app/")
+    tasks.named("optimizedDockerfileNative") {
+        editDockerfile {
+            def originalInstructions = new ArrayList(instructions.get())
+            int runIndex = originalInstructions.findIndexOf { it.keyword == "RUN" && it.text.startsWith("RUN native-image") }
+            def instruction = originalInstructions.get(runIndex)
+            before(instruction.text) {
+                insert("COPY --link dd-java-agent.jar /home/app/")
+            }
         }
     }
 }
 
 tasks.named("dockerBuild") {
-    images = [dockerImage]
+    images = [dockerImage.get()]
 }
 
 tasks.named("dockerBuildNative") {
-    images = [dockerImage]
+    images = [dockerImage.get()]
 }
 
 tasks.named("optimizedDockerBuild") {
-    images = [dockerImage]
+    images = [dockerImage.get()]
 }
 
 tasks.named("optimizedDockerBuildNative") {
-    images = [dockerImage]
+    images = [dockerImage.get()]
 }
 
 optimizedBuildLayers {
@@ -239,4 +221,16 @@ optimizedBuildLayers {
 
 optimizedBuildNativeLayersTask {
     dependsOn tasks.optimizedRunnerJitJar
+}
+
+tasks.register("optimizedDockerBuildNativeDatadog") {
+    group = "build"
+    description = "Build the Datadog flavour native Docker image (vanilla image + dd-java-agent.jar + Datadog Lambda extension layer + DD_* env vars + DD-specific native-image build args)."
+    dependsOn tasks.named("optimizedDockerBuildNative")
+}
+
+tasks.register("optimizedDockerPushNativeDatadog") {
+    group = "build"
+    description = "Push the Datadog flavour native Docker image to the configured registry."
+    dependsOn tasks.named("optimizedDockerPushNative")
 }
