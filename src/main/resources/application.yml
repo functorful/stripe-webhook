@@ -1,1 +1,13 @@
 micronaut.application.name: stripe-webhook
+
+# These are populated by the Lambda environment at runtime; Micronaut maps
+# the upper-case `STRIPE_WEBHOOK_SIGNING_SECRET_ARN` env var to
+# `stripe.webhook.signing-secret-arn` automatically, but declaring them here
+# makes the binding explicit and gives a clear failure message if the
+# Lambda environment is misconfigured.
+stripe:
+  webhook:
+    signing-secret-arn: ${STRIPE_WEBHOOK_SIGNING_SECRET_ARN}
+
+webhook-events:
+  table-name: ${WEBHOOK_EVENTS_TABLE_NAME}

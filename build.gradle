@@ -49,7 +49,12 @@ dependencies {
         exclude(group: "software.amazon.awssdk", module: "apache-client")
         exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
     }
+    implementation("software.amazon.awssdk:secretsmanager") {
+        exclude(group: "software.amazon.awssdk", module: "apache-client")
+        exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
+    }
     implementation("software.amazon.awssdk:url-connection-client")
+    implementation("com.fasterxml.jackson.core:jackson-databind")
 
     implementation("io.vavr:vavr:0.11.0")
 
@@ -68,6 +73,10 @@ dependencies {
     testImplementation("org.assertj:assertj-core:3.27.7")
     testImplementation("org.assertj:assertj-vavr:0.4.3")
     testImplementation("software.amazon.awssdk:sts")
+    // Logback is `runtimeOnly` for the production image; expose it to test
+    // compile so tests can attach a ListAppender to assert structured-log
+    // behavior on the cold-start sentinel path.
+    testImplementation("ch.qos.logback:logback-classic")
 }
 
 
