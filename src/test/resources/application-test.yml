@@ -1,1 +1,12 @@
 micronaut.application.name: stripe-webhook-test
+
+# Test defaults — overridden per-test where relevant. The values themselves
+# are not used by tests (the Lambda's Secrets Manager + DynamoDB clients
+# are mocked) but the property bindings must resolve so the application
+# context can start.
+stripe:
+  webhook:
+    signing-secret-arn: arn:aws:secretsmanager:eu-west-1:000000000000:secret:test/stripe-webhook-signing-secret
+
+webhook-events:
+  table-name: WebhookEvent-test

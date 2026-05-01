@@ -4,7 +4,13 @@ AWS Lambda that receives Stripe webhook events, verifies signatures, and persist
 
 ## Status
 
-Bootstrap stub — handler returns HTTP 200 for any input. Real signature-verification and persistence logic to be added in subsequent releases.
+PAY-02 skeleton — verify → dedup → dispatch plumbing is complete; per-event-type handlers (`payment_intent.succeeded` / `.payment_failed`) are no-ops pending PAY-05. The Lambda already:
+
+- Fetches its webhook signing secret from AWS Secrets Manager at cold start (one-shot, cached for the Lambda lifetime).
+- Aborts cold start with a structured error log (ARN only, no secret value) if the fetched value is the `PENDING_PAY-00a` sentinel — Tomás's standing veto trigger for PAY-02 / PAY-04.
+- Verifies the `Stripe-Signature` HMAC-SHA256 with a 5-minute timestamp tolerance, accepts multi-`v1` rotation headers, constant-time compare.
+- Conditionally `PutItem`s on `WebhookEvent.eventId` for at-least-once-delivery dedup; replays return 200 fast without re-processing.
+- Returns generic `{"error":"invalid request"}` 400s on every signature / body failure (no detail leakage).
 
 ## Container images
 
@@ -52,4 +58,26 @@ Override with `DOCKER_IMAGE_TAG=…` (the `-dd` suffix is appended automatically
 
 ## Handler
 
-`com.functorful.stripewebhook.FunctionRequestHandler` — entry point for API Gateway v2 HTTP events.
+`com.functorful.stripewebhook.FunctionRequestHandler` — entry point for API Gateway v2 HTTP events. Thin wrapper that delegates to `WebhookEventProcessor`, which contains all orchestration logic and is unit-tested directly without a Micronaut application context.
+
+## Required Lambda environment variables
+
+| Variable | Source | Purpose |
+|---|---|---|
+| `STRIPE_WEBHOOK_SIGNING_SECRET_ARN` | OpenTofu (`aws-stripe-webhook-lambda.tofu`) | Secrets Manager ARN to fetch the webhook signing secret from at cold start. |
+| `WEBHOOK_EVENTS_TABLE_NAME` | OpenTofu (Amplify SSM bridge) | Physical name of the Amplify-managed `WebhookEvent` DynamoDB table used for idempotency dedup. |
+| `AWS_REGION` | Lambda runtime | Standard. |
+
+Both are provisioned by the OpenTofu IaC in `gitlab.com/functorful/projects/sobrado/infrastructure`. See `runbooks/stripe-test-secrets-bootstrap.md` for dev setup.
+
+## IAM (least privilege)
+
+The Lambda role grants only:
+
+- `secretsmanager:GetSecretValue` on the webhook signing secret ARN (and Datadog credentials secret).
+- `kms:Decrypt` / `DescribeKey` on the external-trust CMK (where the signing secret is encrypted).
+- `kms:Decrypt` / `Encrypt` / `GenerateDataKey` on the application CMK (DynamoDB SSE).
+- `dynamodb:GetItem` / `PutItem` / `UpdateItem` / `Query` on `*WebhookEvent*` and `*InvestmentPayment*` table ARNs.
+- `ecr:*` for image pull from the GHCR pull-through cache.
+
+The Lambda has **no** access to the Stripe API key — that secret is read by `payment-lambda` (PAY-04) under a separate IAM role per Tomás's spec.
