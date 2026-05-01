@@ -18,6 +18,7 @@ jobs:
         flavor: [vanilla, dd]
 
     permissions:
+      id-token: write
       contents: read
       packages: write
 
@@ -47,6 +48,15 @@ jobs:
             echo "tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
             echo "gradle_task=optimizedDockerBuildNative" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Configure AWS credentials (public ECR)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::879090019401:role/functorful/dev/github-ci-public-ecr-pull
+          aws-region: us-east-1
+
+      - name: Login to public ECR
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
 
       - name: Build native Docker image
         run: ./gradlew --build-cache ${{ steps.meta.outputs.gradle_task }}
