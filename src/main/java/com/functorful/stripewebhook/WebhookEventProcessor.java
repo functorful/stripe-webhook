@@ -10,6 +10,7 @@ import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore.RecordRe
 import com.functorful.stripewebhook.secret.StripeWebhookSigningSecret;
 import com.functorful.stripewebhook.signature.InvalidSignatureException;
 import com.functorful.stripewebhook.signature.StripeSignatureVerifier;
+import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 
@@ -57,6 +58,7 @@ public class WebhookEventProcessor {
      * Verify → dedup → dispatch. See {@link FunctionRequestHandler} for
      * the failure mapping.
      */
+    @NewSpan
     public APIGatewayV2HTTPResponse process(APIGatewayV2HTTPEvent input) {
         String rawBody = input.getBody() == null ? "" : input.getBody();
 

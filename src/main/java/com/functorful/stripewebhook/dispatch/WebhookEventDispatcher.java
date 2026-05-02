@@ -1,5 +1,6 @@
 package com.functorful.stripewebhook.dispatch;
 
+import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 
@@ -41,6 +42,7 @@ public class WebhookEventDispatcher {
      * @param eventId   the {@code id} of the event, included in the log
      *                  line for traceability.
      */
+    @NewSpan
     public void dispatch(String eventType, String eventId) {
         if (eventType == null) {
             log.warn("Webhook event has null type; skipping dispatch. eventId={}", eventId);
