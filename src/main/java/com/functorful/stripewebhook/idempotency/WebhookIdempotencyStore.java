@@ -1,6 +1,7 @@
 package com.functorful.stripewebhook.idempotency;
 
 import io.micronaut.context.annotation.Value;
+import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -60,6 +61,7 @@ public class WebhookIdempotencyStore {
      *                schema for forward compatibility with Revolut + Loqr).
      * @param now     the wall-clock instant at which the event was received.
      */
+    @NewSpan
     public RecordResult recordFirstDelivery(String eventId, String source, Instant now) {
         long ttlEpochSeconds = now.plus(RETENTION).getEpochSecond();
 
