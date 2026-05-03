@@ -1,8 +1,12 @@
 package com.functorful.stripewebhook.dispatch;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThatCode;
 
@@ -23,22 +27,22 @@ class IgnoredEventHandlerTest {
             "made_up_event"
     })
     void neverThrowsForAnyEventType(String eventType) {
-        assertThatCode(() -> handler.handle(eventType, "evt_ignored_1"))
-                .doesNotThrowAnyException();
+        StripeWebhookEvent event = newEvent("evt_ignored_1", eventType);
+        assertThatCode(() -> handler.handle(event)).doesNotThrowAnyException();
     }
 
     @Test
     void neverThrowsForNullEventType() {
-        assertThatCode(() -> handler.handle(null, "evt_null_1"))
-                .doesNotThrowAnyException();
+        StripeWebhookEvent event = newEvent("evt_null_type_1", null);
+        assertThatCode(() -> handler.handle(event)).doesNotThrowAnyException();
     }
 
-    @Test
-    void neverThrowsForNullEventId() {
-        // Defensive — eventId comes from the body's id field, which the
-        // processor validates non-null before reaching dispatch. Belt and
-        // braces in case the orchestrator order changes.
-        assertThatCode(() -> handler.handle("payment_intent.created", null))
-                .doesNotThrowAnyException();
+    private static StripeWebhookEvent newEvent(String eventId, String eventType) {
+        return new StripeWebhookEvent(
+                eventId,
+                eventType,
+                Instant.parse("2026-05-03T10:00:00Z"),
+                JsonNodeFactory.instance.objectNode()
+        );
     }
 }

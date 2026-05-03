@@ -1,8 +1,9 @@
 package com.functorful.stripewebhook.dispatch;
 
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
+
 /**
- * Sealed interface for per-event-type handlers dispatched by
- * {@link WebhookEventDispatcher}.
+ * Per-event-type handler dispatched by {@link WebhookEventDispatcher}.
  *
  * <p>The dispatcher injects a {@code Map<String, EventHandler>} keyed by
  * Stripe event type ({@code payment_intent.succeeded},
@@ -27,10 +28,11 @@ package com.functorful.stripewebhook.dispatch;
  * design doc §6).
  *
  * <p>Failure semantics: a handler that throws causes the dispatcher to
- * log the exception and the surrounding orchestrator to return 200 to
- * Stripe (the {@code WebhookEvent} idempotency row is already recorded;
- * we don't want Stripe retrying a poison pill). The row is left with
- * {@code processed = false} so an ops sweep can re-drive it manually.
+ * propagate, the surrounding orchestrator catches the throw and returns
+ * 200 to Stripe (the {@code WebhookEvent} idempotency row is already
+ * recorded; we don't want Stripe retrying a poison pill). The row is
+ * left with {@code processed = false} so an ops sweep can re-drive it
+ * manually.
  */
 public interface EventHandler {
 
@@ -39,10 +41,8 @@ public interface EventHandler {
      * been verified and whose first-delivery has already been recorded
      * in the idempotency store.
      *
-     * @param eventType the Stripe event type (e.g.
-     *                  {@code payment_intent.succeeded}).
-     * @param eventId   the Stripe event id ({@code evt_...}). Useful for
-     *                  log correlation.
+     * @param event the verified, parsed event — see
+     *              {@link StripeWebhookEvent} for field semantics.
      */
-    void handle(String eventType, String eventId);
+    void handle(StripeWebhookEvent event);
 }

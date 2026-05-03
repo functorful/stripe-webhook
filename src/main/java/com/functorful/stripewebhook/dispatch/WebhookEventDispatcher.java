@@ -1,5 +1,6 @@
 package com.functorful.stripewebhook.dispatch;
 
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
 import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
@@ -53,18 +54,16 @@ public class WebhookEventDispatcher {
     /**
      * Dispatch the given event to the handler registered for its type.
      *
-     * @param eventType the {@code type} field of the Stripe webhook
-     *                  event (e.g. {@code payment_intent.succeeded}).
-     *                  May be {@code null} if the body is malformed —
-     *                  routes to {@link IgnoredEventHandler}.
-     * @param eventId   the {@code id} of the event, included in the log
-     *                  line for traceability.
+     * @param event the verified, parsed event — routes by
+     *              {@link StripeWebhookEvent#eventType()}; falls
+     *              through to {@link IgnoredEventHandler} when the
+     *              type is {@code null} or unrecognised.
      */
     @NewSpan
-    public void dispatch(String eventType, String eventId) {
-        EventHandler handler = eventType == null
+    public void dispatch(StripeWebhookEvent event) {
+        EventHandler handler = event.eventType() == null
                 ? ignoredHandler
-                : handlersByType.getOrDefault(eventType, ignoredHandler);
-        handler.handle(eventType, eventId);
+                : handlersByType.getOrDefault(event.eventType(), ignoredHandler);
+        handler.handle(event);
     }
 }

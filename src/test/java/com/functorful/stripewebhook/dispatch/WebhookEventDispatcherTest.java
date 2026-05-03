@@ -1,13 +1,17 @@
 package com.functorful.stripewebhook.dispatch;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.functorful.stripewebhook.dispatch.handlers.PaymentIntentFailedHandler;
 import com.functorful.stripewebhook.dispatch.handlers.PaymentIntentSucceededHandler;
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.time.Instant;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,18 +52,22 @@ class WebhookEventDispatcherTest {
 
     @Test
     void routesPaymentIntentSucceededToSucceededHandler() {
-        dispatcher.dispatch("payment_intent.succeeded", "evt_succeeded_1");
+        StripeWebhookEvent event = newEvent("evt_succeeded_1", "payment_intent.succeeded");
 
-        verify(succeededHandler).handle("payment_intent.succeeded", "evt_succeeded_1");
+        dispatcher.dispatch(event);
+
+        verify(succeededHandler).handle(event);
         verifyNoInteractions(failedHandler);
         verifyNoInteractions(ignoredHandler);
     }
 
     @Test
     void routesPaymentIntentPaymentFailedToFailedHandler() {
-        dispatcher.dispatch("payment_intent.payment_failed", "evt_failed_1");
+        StripeWebhookEvent event = newEvent("evt_failed_1", "payment_intent.payment_failed");
 
-        verify(failedHandler).handle("payment_intent.payment_failed", "evt_failed_1");
+        dispatcher.dispatch(event);
+
+        verify(failedHandler).handle(event);
         verifyNoInteractions(succeededHandler);
         verifyNoInteractions(ignoredHandler);
     }
@@ -72,9 +80,11 @@ class WebhookEventDispatcherTest {
             "made_up_event"
     })
     void routesUnrecognisedTypeToIgnoredHandler(String eventType) {
-        dispatcher.dispatch(eventType, "evt_unknown_1");
+        StripeWebhookEvent event = newEvent("evt_unknown_1", eventType);
 
-        verify(ignoredHandler).handle(eventType, "evt_unknown_1");
+        dispatcher.dispatch(event);
+
+        verify(ignoredHandler).handle(event);
         verifyNoInteractions(succeededHandler);
         verifyNoInteractions(failedHandler);
     }
@@ -82,33 +92,38 @@ class WebhookEventDispatcherTest {
     @Test
     void routesNullEventTypeToIgnoredHandler() {
         // Defensive — happens for malformed but HMAC-valid bodies (rare).
-        dispatcher.dispatch(null, "evt_null_type_1");
+        StripeWebhookEvent event = newEvent("evt_null_type_1", null);
 
-        verify(ignoredHandler).handle(null, "evt_null_type_1");
+        dispatcher.dispatch(event);
+
+        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        verify(ignoredHandler).handle(captor.capture());
+        assertThat(captor.getValue().eventType()).isNull();
         verifyNoInteractions(succeededHandler);
         verifyNoInteractions(failedHandler);
     }
 
     @Test
-    void dispatcherDoesNotThrowWhenHandlerThrows() {
+    void dispatcherDoesNotSwallowHandlerExceptions() {
         // The orchestrator (WebhookEventProcessor) is responsible for the
         // catch — see WebhookEventProcessor#process. The dispatcher itself
         // does not swallow handler exceptions; it lets them propagate so
         // the orchestrator's catch can log + return 200.
         EventHandler throwing = Mockito.mock(EventHandler.class);
         Mockito.doThrow(new RuntimeException("handler exploded"))
-                .when(throwing).handle(Mockito.any(), Mockito.any());
+                .when(throwing).handle(Mockito.any());
 
         WebhookEventDispatcher dispatcherWithThrowing = new WebhookEventDispatcher(
                 Map.of("boom", throwing),
                 ignoredHandler
         );
+        StripeWebhookEvent event = newEvent("evt_boom", "boom");
 
-        assertThatCode(() -> dispatcherWithThrowing.dispatch("boom", "evt_boom"))
+        assertThatCode(() -> dispatcherWithThrowing.dispatch(event))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessage("handler exploded");
 
-        verify(throwing, atLeastOnce()).handle("boom", "evt_boom");
+        verify(throwing, atLeastOnce()).handle(event);
     }
 
     @Test
@@ -117,12 +132,14 @@ class WebhookEventDispatcherTest {
                 Map.of(),
                 ignoredHandler
         );
+        StripeWebhookEvent succeeded = newEvent("evt_empty_1", "payment_intent.succeeded");
+        StripeWebhookEvent nullType = newEvent("evt_empty_2", null);
 
-        emptyDispatcher.dispatch("payment_intent.succeeded", "evt_empty_1");
-        emptyDispatcher.dispatch(null, "evt_empty_2");
+        emptyDispatcher.dispatch(succeeded);
+        emptyDispatcher.dispatch(nullType);
 
-        verify(ignoredHandler).handle("payment_intent.succeeded", "evt_empty_1");
-        verify(ignoredHandler).handle(null, "evt_empty_2");
+        verify(ignoredHandler).handle(succeeded);
+        verify(ignoredHandler).handle(nullType);
     }
 
     @Test
@@ -132,5 +149,14 @@ class WebhookEventDispatcherTest {
         WebhookEventDispatcher d2 = new WebhookEventDispatcher(Map.of(), ignoredHandler);
 
         assertThat(d1).isNotSameAs(d2);
+    }
+
+    private static StripeWebhookEvent newEvent(String eventId, String eventType) {
+        return new StripeWebhookEvent(
+                eventId,
+                eventType,
+                Instant.parse("2026-05-03T10:00:00Z"),
+                JsonNodeFactory.instance.objectNode()
+        );
     }
 }

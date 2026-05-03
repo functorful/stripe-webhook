@@ -4,7 +4,9 @@ import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.MissingNode;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore.RecordResult;
 import com.functorful.stripewebhook.secret.StripeWebhookSigningSecret;
@@ -64,6 +66,9 @@ public class WebhookEventProcessor {
 
         try {
             String signatureHeader = readHeaderCaseInsensitive(input, STRIPE_SIGNATURE_HEADER);
+            // Tomás veto: do NOT echo rawBody in the failure log path.
+            // The exception message is parameterised and contains only
+            // the failure category, never body content.
             signatureVerifier.verify(signatureHeader, rawBody, signingSecret);
         } catch (InvalidSignatureException e) {
             log.warn("Stripe webhook signature verification failed. reason={}", e.getMessage());
@@ -92,15 +97,42 @@ public class WebhookEventProcessor {
             return ok();
         }
 
+        StripeWebhookEvent event = buildEvent(eventId, eventType, root, now);
         try {
-            dispatcher.dispatch(eventType, eventId);
+            dispatcher.dispatch(event);
         } catch (RuntimeException e) {
+            // Idempotency row is already written; replay would short-
+            // circuit. Don't 5xx Stripe (it would retry); don't leak
+            // server-side error to the wire.
             log.error("Webhook event dispatch failed; row already recorded. eventId={} errorClass={}",
                     eventId, e.getClass().getSimpleName(), e);
             return ok();
         }
 
         return ok();
+    }
+
+    /**
+     * Build the typed event passed to handlers. Pulls
+     * {@code data.object} as the type-specific payload (handlers walk
+     * it themselves), and {@code event.created} (epoch second) as an
+     * {@link Instant} — falls back to {@code now} if Stripe omitted it
+     * (the webhook stream always includes it; this is defensive).
+     */
+    private static StripeWebhookEvent buildEvent(
+            String eventId,
+            String eventType,
+            JsonNode root,
+            Instant now
+    ) {
+        JsonNode dataObject = root.path("data").path("object");
+        if (dataObject.isMissingNode() || dataObject.isNull()) {
+            dataObject = MissingNode.getInstance();
+        }
+        Instant created = root.has("created") && root.get("created").isNumber()
+                ? Instant.ofEpochSecond(root.get("created").asLong())
+                : now;
+        return new StripeWebhookEvent(eventId, eventType, created, dataObject);
     }
 
     private static APIGatewayV2HTTPResponse ok() {
