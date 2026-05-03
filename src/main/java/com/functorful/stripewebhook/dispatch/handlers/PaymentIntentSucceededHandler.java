@@ -1,46 +1,59 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.functorful.stripewebhook.dispatch.EventHandler;
+import com.functorful.stripewebhook.dynamodb.AuditLogStore;
+import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
+import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
+import com.functorful.stripewebhook.dynamodb.PaymentView;
+import com.functorful.stripewebhook.dynamodb.ReservationView;
+import com.functorful.stripewebhook.dynamodb.UserInvestmentStore;
+import com.functorful.stripewebhook.email.SesEmailService;
 import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.reservation.ReservationKey;
 import io.micronaut.context.annotation.Bean;
+import io.micronaut.context.annotation.Value;
 import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.Put;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest;
+import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException;
+import software.amazon.awssdk.services.dynamodb.model.Update;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
 
 /**
- * Handler for {@code payment_intent.succeeded} (PAY-05).
+ * Handler for {@code payment_intent.succeeded}. Implements the
+ * {@code docs/pay-05-handler-design.md} §4.1 sequence:
  *
- * <p><strong>Phase 2 status: SCAFFOLD WITH TYPED EVENT.</strong> The
- * dispatcher now passes a {@link StripeWebhookEvent} carrying the
- * parsed {@code event.data.object} JSON node, which is the input shape
- * the real handler body needs. The body itself (4-item
- * {@code TransactWriteItems} + AuditLog row + SES email — see
- * {@code docs/pay-05-handler-design.md} §4.1) lands in a follow-up MR
- * once:
+ * <ol>
+ *   <li>Extract the reservation key from the Stripe PaymentIntent metadata.</li>
+ *   <li>Load reservation; guard {@code status == "confirmed"}.</li>
+ *   <li>Load payment by reservation FK + paymentIntentId; guard {@code status == "processed"}.</li>
+ *   <li>Single {@code TransactWriteItems} (atomic): payment {@code processed -> success},
+ *       reservation {@code confirmed -> executed}, idempotent put UserInvestment, put AuditLog.</li>
+ *   <li>SES confirmation email (best-effort).</li>
+ * </ol>
  *
- * <ul>
- *   <li>The infrastructure repo's IAM scope expansion lands (DDB
- *       grants on {@code InvestmentReservation} / {@code UserInvestment}
- *       / {@code AuditLog} tables, {@code ses:SendEmail} on the
- *       from-address identity, 5 new env vars wired through the SSM
- *       bridge).</li>
- *   <li>The payment-lambda repo extends the Stripe PaymentIntent
- *       metadata block to include {@code paymentRowId} and
- *       {@code paymentRowVersion} so this handler can do a direct
- *       DDB {@code GetItem} instead of a reservation-FK Query +
- *       in-code filter on {@code stripePaymentIntentId}. (See
- *       {@code docs/pay-05-handler-design.md} §4.1 for the
- *       reservation-FK fallback path; the metadata-extension path is
- *       a small follow-up that simplifies the lookup.)</li>
- * </ul>
+ * <p><strong>Status-guard posture:</strong> guard violations log + return
+ * 200 (do NOT throw — the WebhookEvent row is already recorded; we don't
+ * want Stripe retrying a poison pill, and we don't want a 5xx leaking to
+ * the wire). Real bugs (transient DDB, IAM regressions) propagate via a
+ * non-{@link TransactionCanceledException}; the orchestrator's outer catch
+ * logs at ERROR and returns 200 (Tomás §10 R4).
  *
- * <p>Today's body logs the event with the Stripe-Dashboard-correlable
- * fields extracted from {@code event.data.object} (the
- * {@code paymentIntentId} and the metadata block). This is a strict
- * superset of PAY-02's no-op log and gives ops visibility into what
- * the handler will eventually act on, without touching any business
- * state.
+ * <p><strong>Idempotency:</strong> guaranteed at the dispatcher boundary
+ * by {@code WebhookEvent.eventId} (PAY-02). Within the handler, the
+ * {@code attribute_not_exists(userId)} on the UserInvestment put gives a
+ * second-line defense for the partial-write recovery path (§6).
  */
 @Slf4j
 @Singleton
@@ -48,19 +61,244 @@ import lombok.extern.slf4j.Slf4j;
 @Named("payment_intent.succeeded")
 public class PaymentIntentSucceededHandler implements EventHandler {
 
+    /** Status-transition matrix expectations (per ARCH-04 / resource.ts). */
+    private static final String RESERVATION_EXPECTED = "confirmed";
+    private static final String RESERVATION_TARGET = "executed";
+    private static final String PAYMENT_EXPECTED = "processed";
+    private static final String PAYMENT_TARGET = "success";
+
+    private static final String AUDIT_RESOURCE_PREFIX = "InvestmentReservation:";
+    private static final String AUDIT_ACTION_SUCCEEDED = "payment.succeeded";
+
+    private final InvestmentReservationStore reservationStore;
+    private final InvestmentPaymentStore paymentStore;
+    private final UserInvestmentStore userInvestmentStore;
+    private final AuditLogStore auditLogStore;
+    private final SesEmailService sesEmailService;
+    private final DynamoDbClient dynamoDbClient;
+    private final ObjectMapper objectMapper;
+    private final String lambdaVersion;
+    private final String gitSha;
+
+    public PaymentIntentSucceededHandler(
+            InvestmentReservationStore reservationStore,
+            InvestmentPaymentStore paymentStore,
+            UserInvestmentStore userInvestmentStore,
+            AuditLogStore auditLogStore,
+            SesEmailService sesEmailService,
+            DynamoDbClient dynamoDbClient,
+            @Value("${dd.version:unknown}") String lambdaVersion,
+            @Value("${git.sha:unknown}") String gitSha
+    ) {
+        this(reservationStore, paymentStore, userInvestmentStore, auditLogStore,
+                sesEmailService, dynamoDbClient, new ObjectMapper(), lambdaVersion, gitSha);
+    }
+
+    /** Test seam — injects an ObjectMapper for deterministic JSON ordering. */
+    PaymentIntentSucceededHandler(
+            InvestmentReservationStore reservationStore,
+            InvestmentPaymentStore paymentStore,
+            UserInvestmentStore userInvestmentStore,
+            AuditLogStore auditLogStore,
+            SesEmailService sesEmailService,
+            DynamoDbClient dynamoDbClient,
+            ObjectMapper objectMapper,
+            String lambdaVersion,
+            String gitSha
+    ) {
+        this.reservationStore = reservationStore;
+        this.paymentStore = paymentStore;
+        this.userInvestmentStore = userInvestmentStore;
+        this.auditLogStore = auditLogStore;
+        this.sesEmailService = sesEmailService;
+        this.dynamoDbClient = dynamoDbClient;
+        this.objectMapper = objectMapper;
+        this.lambdaVersion = lambdaVersion;
+        this.gitSha = gitSha;
+    }
+
     @Override
     @NewSpan
     public void handle(StripeWebhookEvent event) {
-        // PAY-05 follow-up MR replaces this body with the real
-        // TransactWriteItems + AuditLog + SES email implementation.
-        // See docs/pay-05-handler-design.md §4.1.
-        String paymentIntentId = event.dataObject().path("id").asText("");
-        log.info(
-                "payment_intent.succeeded received; PAY-05 follow-up MR "
-                        + "implements the TransactWriteItems + AuditLog + SES email. "
-                        + "eventId={} paymentIntentId={}",
-                event.eventId(),
-                paymentIntentId
-        );
+        Instant receivedAt = Instant.now();
+
+        // 1. Extract paymentIntentId + reservation key from event payload.
+        JsonNode dataObject = event.dataObject();
+        String paymentIntentId = textOrEmpty(dataObject, "id");
+        if (paymentIntentId.isEmpty()) {
+            // Tomás §10 M4 case 16: defensive — log + return.
+            log.warn("payment_intent.succeeded event missing data.object.id; skipping. eventId={}",
+                    event.eventId());
+            return;
+        }
+
+        ReservationKey reservationKey;
+        try {
+            reservationKey = ReservationKey.fromStripeMetadata(dataObject.get("metadata"));
+        } catch (IllegalArgumentException e) {
+            log.warn("payment_intent.succeeded event has incomplete metadata; skipping. "
+                            + "eventId={} missingField={}",
+                    event.eventId(), e.getMessage());
+            return;
+        }
+
+        // 2. Load reservation; guard.
+        Optional<ReservationView> reservationOpt = reservationStore.load(reservationKey);
+        if (reservationOpt.isEmpty()) {
+            log.warn("InvestmentReservation not found for succeeded webhook; skipping. "
+                            + "eventId={} reservationUserId={} reservationInvestmentId={}",
+                    event.eventId(), reservationKey.userId(), reservationKey.investmentId());
+            return;
+        }
+        ReservationView reservation = reservationOpt.get();
+        if (!RESERVATION_EXPECTED.equals(reservation.status())) {
+            log.warn("Reservation status guard tripped on succeeded webhook; skipping. "
+                            + "eventId={} actual={} expected={}",
+                    event.eventId(), reservation.status(), RESERVATION_EXPECTED);
+            return;
+        }
+
+        // 3. Load payment by reservation FK + paymentIntentId; guard.
+        Optional<PaymentView> paymentOpt = paymentStore.findByReservationAndIntent(
+                reservationKey, paymentIntentId);
+        if (paymentOpt.isEmpty()) {
+            log.warn("InvestmentPayment not found for succeeded webhook; skipping. "
+                    + "eventId={} paymentIntentIdHash={}", event.eventId(), paymentIntentId.hashCode());
+            return;
+        }
+        PaymentView payment = paymentOpt.get();
+        if (!PAYMENT_EXPECTED.equals(payment.status())) {
+            log.warn("Payment status guard tripped on succeeded webhook; skipping. "
+                            + "eventId={} actual={} expected={}",
+                    event.eventId(), payment.status(), PAYMENT_EXPECTED);
+            return;
+        }
+
+        // 4. TransactWriteItems — atomic 4-write set.
+        Instant now = Instant.now();
+        Update updatePayment = paymentStore.buildStatusUpdate(
+                payment.id(), payment.version(),
+                PAYMENT_EXPECTED, PAYMENT_TARGET,
+                event.created(), null);
+        Update updateReservation = reservationStore.buildStatusUpdate(
+                reservationKey, RESERVATION_EXPECTED, RESERVATION_TARGET, now);
+        Put putUserInvestment = userInvestmentStore.buildIdempotentPut(
+                reservationKey.userId(),
+                reservationKey.investmentId(),
+                reservationKey.investmentVersion(),
+                reservation.participations(),
+                now);
+        ObjectNode details = buildAuditDetails(
+                event, paymentIntentId, payment, reservationKey,
+                receivedAt,
+                /* lastPaymentErrorCode */ null,
+                /* lastPaymentError */ null,
+                /* paymentTransition */ PAYMENT_EXPECTED + " -> " + PAYMENT_TARGET,
+                /* reservationTransition */ RESERVATION_EXPECTED + " -> " + RESERVATION_TARGET);
+        Put putAuditLog = auditLogStore.buildPut(new AuditLogStore.Entry(
+                payment.userId(),
+                event.created(),
+                AUDIT_RESOURCE_PREFIX + reservationFingerprint(reservationKey),
+                AUDIT_ACTION_SUCCEEDED,
+                details));
+
+        TransactWriteItemsRequest twiRequest = TransactWriteItemsRequest.builder()
+                .transactItems(List.of(
+                        TransactWriteItem.builder().update(updatePayment).build(),
+                        TransactWriteItem.builder().update(updateReservation).build(),
+                        TransactWriteItem.builder().put(putUserInvestment).build(),
+                        TransactWriteItem.builder().put(putAuditLog).build()))
+                .build();
+
+        try {
+            dynamoDbClient.transactWriteItems(twiRequest);
+        } catch (TransactionCanceledException tcx) {
+            // Tomás §10 R4: this catch is specific. A guard violation
+            // discovered concurrently (e.g., two replays racing) shows
+            // up here as ConditionalCheckFailed — log + return; do NOT
+            // propagate.
+            log.warn("TransactWriteItems cancelled on succeeded webhook (likely concurrent guard "
+                            + "violation or partial-write recovery target). Inspecting reasons. "
+                            + "eventId={} reasons={}",
+                    event.eventId(),
+                    tcx.cancellationReasons());
+            return;
+        }
+
+        // 5. SES confirmation email — best-effort.
+        String receiptEmail = textOrEmpty(dataObject, "receipt_email");
+        if (!receiptEmail.isEmpty()) {
+            sesEmailService.sendPaymentConfirmation(
+                    receiptEmail,
+                    reservation.participations(),
+                    payment.amountCents(),
+                    paymentIntentId);
+        } else {
+            // PAY-21 follow-up: PaymentLambda's metadata block may
+            // additionally carry the verified email; for now, when
+            // receipt_email isn't populated by Stripe, we skip the
+            // email send. The investor still sees confirmation in-app
+            // via the existing DDB-stream → AppSync subscription.
+            log.info("payment_intent.succeeded delivered without receipt_email; "
+                            + "skipping email send. eventId={}",
+                    event.eventId());
+        }
+
+        log.info("payment_intent.succeeded processed end-to-end. eventId={} paymentIntentIdHash={} "
+                        + "transition=payment[{} -> {}]+reservation[{} -> {}]",
+                event.eventId(), paymentIntentId.hashCode(),
+                PAYMENT_EXPECTED, PAYMENT_TARGET,
+                RESERVATION_EXPECTED, RESERVATION_TARGET);
+    }
+
+    private ObjectNode buildAuditDetails(
+            StripeWebhookEvent event,
+            String paymentIntentId,
+            PaymentView payment,
+            ReservationKey reservationKey,
+            Instant receivedAt,
+            String lastPaymentErrorCode,
+            String lastPaymentError,
+            String paymentTransition,
+            String reservationTransition
+    ) {
+        ObjectNode details = objectMapper.createObjectNode();
+        details.put("provider", "stripe");
+        details.put("actor", "stripe-webhook-lambda");
+        details.put("lambdaVersion", lambdaVersion);
+        details.put("gitSha", gitSha);
+        details.put("eventId", event.eventId());
+        details.put("stripePaymentIntentId", paymentIntentId);
+        details.put("paymentRowId", payment.id());
+        details.put("paymentRowVersion", payment.version());
+        details.put("receivedAt", receivedAt.toString());
+        ObjectNode keyNode = details.putObject("reservationKey");
+        keyNode.put("userId", reservationKey.userId());
+        keyNode.put("investmentId", reservationKey.investmentId());
+        keyNode.put("investmentVersion", reservationKey.investmentVersion());
+        keyNode.put("requestedAt", reservationKey.requestedAt());
+        keyNode.put("version", reservationKey.version());
+        details.put("amountCents", payment.amountCents());
+        details.put("currency", payment.currency());
+        ObjectNode transition = details.putObject("transition");
+        transition.put("payment", paymentTransition);
+        transition.put("reservation", reservationTransition);
+        if (lastPaymentErrorCode != null) {
+            details.put("lastPaymentErrorCode", lastPaymentErrorCode);
+        }
+        if (lastPaymentError != null) {
+            details.put("lastPaymentError", lastPaymentError);
+        }
+        return details;
+    }
+
+    private static String reservationFingerprint(ReservationKey key) {
+        return key.userId() + "|" + key.investmentId() + "#" + key.investmentVersion()
+                + "@" + key.requestedAt() + "/v" + key.version();
+    }
+
+    private static String textOrEmpty(JsonNode root, String field) {
+        JsonNode node = root == null ? null : root.get(field);
+        return node == null || !node.isTextual() ? "" : node.asText();
     }
 }
