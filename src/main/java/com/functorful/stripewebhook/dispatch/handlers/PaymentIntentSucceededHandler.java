@@ -12,6 +12,7 @@ import com.functorful.stripewebhook.dynamodb.ReservationView;
 import com.functorful.stripewebhook.dynamodb.UserInvestmentStore;
 import com.functorful.stripewebhook.email.SesEmailService;
 import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
 import io.micronaut.context.annotation.Bean;
 import io.micronaut.context.annotation.Value;
@@ -75,6 +76,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
     private final UserInvestmentStore userInvestmentStore;
     private final AuditLogStore auditLogStore;
     private final SesEmailService sesEmailService;
+    private final WebhookIdempotencyStore idempotencyStore;
     private final DynamoDbClient dynamoDbClient;
     private final ObjectMapper objectMapper;
     private final String lambdaVersion;
@@ -86,12 +88,14 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             UserInvestmentStore userInvestmentStore,
             AuditLogStore auditLogStore,
             SesEmailService sesEmailService,
+            WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
             @Value("${dd.version:unknown}") String lambdaVersion,
             @Value("${git.sha:unknown}") String gitSha
     ) {
         this(reservationStore, paymentStore, userInvestmentStore, auditLogStore,
-                sesEmailService, dynamoDbClient, new ObjectMapper(), lambdaVersion, gitSha);
+                sesEmailService, idempotencyStore, dynamoDbClient, new ObjectMapper(),
+                lambdaVersion, gitSha);
     }
 
     /** Test seam — injects an ObjectMapper for deterministic JSON ordering. */
@@ -101,6 +105,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             UserInvestmentStore userInvestmentStore,
             AuditLogStore auditLogStore,
             SesEmailService sesEmailService,
+            WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
             ObjectMapper objectMapper,
             String lambdaVersion,
@@ -111,6 +116,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         this.userInvestmentStore = userInvestmentStore;
         this.auditLogStore = auditLogStore;
         this.sesEmailService = sesEmailService;
+        this.idempotencyStore = idempotencyStore;
         this.dynamoDbClient = dynamoDbClient;
         this.objectMapper = objectMapper;
         this.lambdaVersion = lambdaVersion;
@@ -243,6 +249,10 @@ public class PaymentIntentSucceededHandler implements EventHandler {
                             + "skipping email send. eventId={}",
                     event.eventId());
         }
+
+        // 6. Mark the WebhookEvent row as processed (best-effort; M3
+        //    alarm catches lingering processed=false rows).
+        idempotencyStore.markProcessed(event.eventId());
 
         log.info("payment_intent.succeeded processed end-to-end. eventId={} paymentIntentIdHash={} "
                         + "transition=payment[{} -> {}]+reservation[{} -> {}]",

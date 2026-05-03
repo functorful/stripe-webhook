@@ -10,6 +10,7 @@ import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
 import com.functorful.stripewebhook.dynamodb.PaymentView;
 import com.functorful.stripewebhook.dynamodb.ReservationView;
 import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
 import io.micronaut.context.annotation.Bean;
 import io.micronaut.context.annotation.Value;
@@ -77,6 +78,7 @@ public class PaymentIntentFailedHandler implements EventHandler {
     private final InvestmentReservationStore reservationStore;
     private final InvestmentPaymentStore paymentStore;
     private final AuditLogStore auditLogStore;
+    private final WebhookIdempotencyStore idempotencyStore;
     private final DynamoDbClient dynamoDbClient;
     private final ObjectMapper objectMapper;
     private final String lambdaVersion;
@@ -86,12 +88,13 @@ public class PaymentIntentFailedHandler implements EventHandler {
             InvestmentReservationStore reservationStore,
             InvestmentPaymentStore paymentStore,
             AuditLogStore auditLogStore,
+            WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
             @Value("${dd.version:unknown}") String lambdaVersion,
             @Value("${git.sha:unknown}") String gitSha
     ) {
-        this(reservationStore, paymentStore, auditLogStore, dynamoDbClient,
-                new ObjectMapper(), lambdaVersion, gitSha);
+        this(reservationStore, paymentStore, auditLogStore, idempotencyStore,
+                dynamoDbClient, new ObjectMapper(), lambdaVersion, gitSha);
     }
 
     /** Test seam. */
@@ -99,6 +102,7 @@ public class PaymentIntentFailedHandler implements EventHandler {
             InvestmentReservationStore reservationStore,
             InvestmentPaymentStore paymentStore,
             AuditLogStore auditLogStore,
+            WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
             ObjectMapper objectMapper,
             String lambdaVersion,
@@ -107,6 +111,7 @@ public class PaymentIntentFailedHandler implements EventHandler {
         this.reservationStore = reservationStore;
         this.paymentStore = paymentStore;
         this.auditLogStore = auditLogStore;
+        this.idempotencyStore = idempotencyStore;
         this.dynamoDbClient = dynamoDbClient;
         this.objectMapper = objectMapper;
         this.lambdaVersion = lambdaVersion;
@@ -214,6 +219,10 @@ public class PaymentIntentFailedHandler implements EventHandler {
                     tcx.cancellationReasons(), event.eventId());
             return;
         }
+
+        // Mark the WebhookEvent row as processed (best-effort; M3 alarm
+        // catches lingering processed=false rows).
+        idempotencyStore.markProcessed(event.eventId());
 
         // Tomás §10 M1: log only the code, not the raw message.
         log.info("payment_intent.payment_failed processed. eventId={} paymentIntentIdHash={} "

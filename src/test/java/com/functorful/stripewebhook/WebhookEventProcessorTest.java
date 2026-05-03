@@ -216,6 +216,60 @@ class WebhookEventProcessorTest {
     }
 
     @Test
+    void missingEventCreatedFallsBackToReceiverClock() {
+        // Tomás §10 M4 case 17: a body that passed HMAC verification +
+        // JSON parse + has an event.id but is missing `event.created`
+        // (or has a non-numeric value) must NOT crash. The processor
+        // falls back to the receiver clock for the StripeWebhookEvent's
+        // `created` Instant. Handlers that pin `AuditLog.timestamp` to
+        // `event.created` will then write the receiver clock — slightly
+        // less forensically clean than Stripe-attestable, but correct.
+        //
+        // This is the structural protection for the case 17 invariant;
+        // the regression guard is the assertion that the dispatcher
+        // receives a non-null + non-zero Instant.
+        String bodyNoCreated = "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\","
+                + "\"data\":{\"object\":{}}}"; // no `created` field
+        when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
+                .thenReturn(RecordResult.FIRST_DELIVERY);
+
+        APIGatewayV2HTTPEvent event = httpEventWithBody(bodyNoCreated,
+                buildSignatureHeader(FIXED_NOW_EPOCH, bodyNoCreated, SECRET_VALUE));
+
+        APIGatewayV2HTTPResponse response = processor.process(event);
+
+        assertThat(response.getStatusCode()).isEqualTo(200);
+        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        verify(dispatcher, times(1)).dispatch(captor.capture());
+        StripeWebhookEvent dispatched = captor.getValue();
+        assertThat(dispatched.created())
+                .as("missing event.created falls back to receiver clock; never null, never epoch zero")
+                .isNotNull()
+                .isEqualTo(FIXED_NOW); // the test's fixed clock
+    }
+
+    @Test
+    void nonNumericEventCreatedFallsBackToReceiverClock() {
+        // Sibling of case 17: `created` present but not a number (Stripe
+        // shouldn't ever do this, but the parser must be defensive).
+        String bodyStringCreated = "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\","
+                + "\"created\":\"oops-not-a-number\","
+                + "\"data\":{\"object\":{}}}";
+        when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
+                .thenReturn(RecordResult.FIRST_DELIVERY);
+
+        APIGatewayV2HTTPEvent event = httpEventWithBody(bodyStringCreated,
+                buildSignatureHeader(FIXED_NOW_EPOCH, bodyStringCreated, SECRET_VALUE));
+
+        APIGatewayV2HTTPResponse response = processor.process(event);
+
+        assertThat(response.getStatusCode()).isEqualTo(200);
+        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        verify(dispatcher, times(1)).dispatch(captor.capture());
+        assertThat(captor.getValue().created()).isEqualTo(FIXED_NOW);
+    }
+
+    @Test
     void unknownEventTypeStillReturns200AndRecordsAndDispatches() {
         // Forward-compatible: receiving an event we don't recognise is
         // common (Stripe sends many types). PAY-02 acknowledges all.

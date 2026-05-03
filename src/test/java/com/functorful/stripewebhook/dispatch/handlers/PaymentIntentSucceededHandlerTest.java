@@ -10,6 +10,7 @@ import com.functorful.stripewebhook.dynamodb.ReservationView;
 import com.functorful.stripewebhook.dynamodb.UserInvestmentStore;
 import com.functorful.stripewebhook.email.SesEmailService;
 import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -58,6 +59,7 @@ class PaymentIntentSucceededHandlerTest {
     private UserInvestmentStore userInvestmentStore;
     private AuditLogStore auditLogStore;
     private SesEmailService sesEmailService;
+    private WebhookIdempotencyStore idempotencyStore;
     private DynamoDbClient dynamoDbClient;
     private PaymentIntentSucceededHandler handler;
 
@@ -68,6 +70,7 @@ class PaymentIntentSucceededHandlerTest {
         userInvestmentStore = mock(UserInvestmentStore.class);
         auditLogStore = mock(AuditLogStore.class);
         sesEmailService = mock(SesEmailService.class);
+        idempotencyStore = mock(WebhookIdempotencyStore.class);
         dynamoDbClient = mock(DynamoDbClient.class);
 
         // Stub the store-builder methods to return non-null DDB payloads
@@ -85,7 +88,7 @@ class PaymentIntentSucceededHandlerTest {
 
         handler = new PaymentIntentSucceededHandler(
                 reservationStore, paymentStore, userInvestmentStore,
-                auditLogStore, sesEmailService, dynamoDbClient,
+                auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
                 new ObjectMapper(),
                 "v0.0.5", "abc123"
         );
@@ -141,6 +144,9 @@ class PaymentIntentSucceededHandlerTest {
                 eq(PARTICIPATIONS),
                 eq(AMOUNT_CENTS),
                 eq(PAYMENT_INTENT_ID));
+
+        // 4. WebhookEvent.processed = true after success.
+        verify(idempotencyStore).markProcessed(EVENT_ID);
     }
 
     // ------------------------------------------------------------
