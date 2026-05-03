@@ -1,7 +1,7 @@
 # PAY-05 — Stripe Webhook Event Handler Design
 
-**Status:** accepted (Phase-1 scope)
-**Reviewers:** Rui (Tech Lead, primary), Tomás (Security Champion, mandatory)
+**Status:** accepted (Phase-1 scope) — **Tomás's PAY-05 design review folded in 2026-05-03 (M1–M4 + R1–R4)**
+**Reviewers:** Rui (Tech Lead, primary), Tomás (Security Champion, APPROVE WITH AMENDMENTS — see §10)
 **Refs:**
 - Notion PAY-05: <https://www.notion.so/34fd48539664810c9036d028db1b5e39>
 - Application repo `amplify/data/resource.ts` (status enums + transition table block)
@@ -137,26 +137,36 @@ Triggered by Stripe `payment_intent.succeeded`. Sequence:
 Triggered by Stripe `payment_intent.payment_failed`. Sequence:
 
 1. Extract `paymentIntentId` from `event.data.object.id`.
-2. Extract `lastPaymentError.message` from `event.data.object` (may be
-   null — Stripe doesn't always populate it on async-failure types).
-3. Query `InvestmentPayment` by `stripePaymentIntentId` GSI.
-4. **Guard:** if `InvestmentPayment.status != "processed"`, log + return.
-5. Read the linked `InvestmentReservation`.
-6. **Guard:** if `InvestmentReservation.status != "confirmed"`, log +
+2. Extract `lastPaymentError.code` (Stripe's category — `card_declined`,
+   `insufficient_funds`, etc.) and `lastPaymentError.message`
+   (vendor-supplied free text) from `event.data.object` (both may be
+   null — Stripe doesn't always populate them on async-failure types).
+3. **Sanitize the error message** (Tomás §10 M1):
+   - Length-cap to **≤500 chars** before persisting.
+   - Strip control characters (`[\x00-\x1F\x7F]`) on write.
+   - Document on the in-app surface (PAY-09 / Flutter) that this field
+     **must not be rendered as HTML** — only as plain text.
+   - **Log only the `errorCode` at INFO**, NOT the raw message. Same
+     posture as PAY-23's `PiiLogFilter` STRICT default. The full
+     sanitized message is persisted to DDB but stays out of CloudWatch.
+4. Query `InvestmentPayment` by `stripePaymentIntentId` GSI.
+5. **Guard:** if `InvestmentPayment.status != "processed"`, log + return.
+6. Read the linked `InvestmentReservation`.
+7. **Guard:** if `InvestmentReservation.status != "confirmed"`, log +
    return.
-7. **Transactional write set:**
+8. **Transactional write set:**
    1. `UpdateItem InvestmentPayment` → `status = "failed"`,
-      `errorMessage = lastPaymentError.message`, with condition
-      `status = "processed"`.
+      `errorMessage = <sanitized + capped lastPaymentError.message>`,
+      with condition `status = "processed"`.
    2. `UpdateItem InvestmentReservation` — branch:
       - if `expiresAt > now()`: `status = "pending"` (allow retry).
         Condition `status = "confirmed"`.
       - else: `status = "expired"`. Condition `status = "confirmed"`.
    3. `PutItem AuditLog` — see §5.
-8. **No email.** Investor sees the failure in-app via the existing
+9. **No email.** Investor sees the failure in-app via the existing
    PaymentBloc subscription path (PAY-09's responsibility — the DDB
    stream → AppSync bridge propagates the status update).
-9. Update `WebhookEvent.processed = true`.
+10. Update `WebhookEvent.processed = true`.
 
 ### 4.3 `IgnoredEventHandler`
 
@@ -187,7 +197,7 @@ Field shapes:
 | eventType  | `DATA_ACCESS`*                                | `DATA_ACCESS`*                                    |
 | resource   | `InvestmentReservation:<reservationKey>`      | same                                              |
 | action     | `payment.succeeded`                           | `payment.failed`                                  |
-| details    | see below                                     | see below                                         |
+| details    | see below — includes `receivedAt` (Tomás §10 M2) and `lambdaVersion`/`gitSha` (Tomás §10 R3) | see below |
 
 \* `AuditEventType` enum currently lacks payment-specific values (the
 schema was authored for the GDPR feature). Two options:
@@ -207,10 +217,13 @@ audit-log search UX needs typed filtering.
 {
   "provider": "stripe",
   "actor": "stripe-webhook-lambda",
+  "lambdaVersion": "v0.0.5",
+  "gitSha": "d01f7c9",
   "eventId": "evt_...",
   "stripePaymentIntentId": "pi_...",
   "paymentRowId": "...",
   "paymentRowVersion": 1,
+  "receivedAt": "2026-05-03T10:00:42Z",
   "reservationKey": {
     "userId": "...",
     "investmentId": "...",
@@ -228,8 +241,26 @@ audit-log search UX needs typed filtering.
 ```
 
 `details` JSON shape (failed) is the same plus
-`lastPaymentError: "..."` (may be `null`) and the transition reads
-`processed -> failed` / `confirmed -> pending` (or `expired`).
+`lastPaymentErrorCode: "..."` (Stripe's categorised code, may be
+`null`) and `lastPaymentError: "..."` (sanitized + capped to 500 chars,
+may be `null`); the transition reads `processed -> failed` /
+`confirmed -> pending` (or `expired`).
+
+**Why `receivedAt` AND `timestamp`** (Tomás §10 M2):
+`AuditLog.timestamp` carries `event.created` (Stripe-attestable wall
+clock); `details.receivedAt` carries the Lambda's wall clock at the
+moment dispatch reached the handler. A meaningful gap between the two
+(>5 min in normal operation) is itself an alarm signal — points at
+either Stripe-side delivery latency or our queueing / retry hops, both
+of which are forensically interesting.
+
+**Why `lambdaVersion` + `gitSha`** (Tomás §10 R3): forensic
+correlation. The Lambda image tag rolls forward over time; without
+the version pinned in the audit row, "which build of the handler
+wrote this row" is only answerable via CloudWatch log retention
+windows. Sourced from the existing `DD_VERSION` env var (image tag)
+and a build-time embedded `git-sha.properties` resource (added under
+the standard `processResources` task).
 
 ## 6. Partial-write recovery
 
@@ -243,6 +274,32 @@ ops dashboard query `WebhookEvent where processed = false and
 receivedAt < now() - 5m` surfaces it. Manual replay is via the AWS
 console or a future ops Lambda.
 
+**CloudWatch alarm** (Tomás §10 M3): make the dashboard query an
+**alarm**, not just a panel. A partial-write that goes unfixed leaves
+a payment in indeterminate state — silent data corruption is the
+worst-class outcome here. Provision an alarm that fires when the
+count of `WebhookEvent` rows with `processed = false` and
+`receivedAt < now() - 5m` is greater than zero for more than 5
+minutes. Routes to the same Slack chatbot as the webhook DLQ alarm
+(via `aws_sns_topic.webhook_dlq_alarms` — already wired by PAY-03 /
+`infrastructure!12`). Ops paging target: <10 min.
+
+Ticket-level note: the alarm itself ships in Phase 2b's infrastructure
+MR (alongside the IAM + env-var expansion); same blast radius, same
+review pair.
+
+**Catch specificity** (Tomás §10 R4): the handler's catch around
+`TransactWriteItems` MUST be `ConditionalCheckFailedException`-specific
+(or, for the transactional API, `TransactionCanceledException`
+followed by inspection of the per-item cancellation reasons). A
+generic `catch (Exception e)` would swallow real bugs (transient DDB,
+IAM regressions, throttling) into the same code path as benign guard
+violations and silently mark them as guard-skip cases. The
+distinction matters: guard violations log+skip+200 (no human action);
+real bugs must propagate to the orchestrator's outer catch which
+logs at ERROR with the exception class + stack and leaves
+`WebhookEvent.processed=false` for the M3 alarm to fire on.
+
 ## 7. IAM scope expansion (infrastructure repo)
 
 Current `aws-stripe-webhook-iam.tofu` grants the Lambda DDB Get/Put/
@@ -255,7 +312,7 @@ adds:
 | `*InvestmentReservation*/index` | `dynamodb:Query`                                |
 | `*UserInvestment*`              | `dynamodb:GetItem`, `dynamodb:PutItem`          |
 | `*AuditLog*`                    | `dynamodb:PutItem`                              |
-| SES (any verified identity)     | `ses:SendEmail` (scoped to from-address ARN)    |
+| SES from-domain identity        | `ses:SendEmail` (scoped to identity ARN AND condition `ses:FromAddress = "noreply@<env-domain>"` per Tomás §10 R2) |
 
 Plus new env vars for table names (resolved via the SSM bridge from
 Amplify, same pattern as `WEBHOOK_EVENTS_TABLE_NAME` from PAY-02):
@@ -271,6 +328,25 @@ Amplify, same pattern as `WEBHOOK_EVENTS_TABLE_NAME` from PAY-02):
 The `transactWriteItems` action does not require its own IAM action —
 DDB authorises each item-level action against the resource (i.e. all
 four resource ARNs above must be allowed for their respective actions).
+
+**Wildcard-ARN scoping note** (Tomás §10 R1): the resource ARN patterns
+above use `*` because Amplify generates per-environment table-name
+suffixes (e.g. `WebhookEvent-s5av65nkjnejtbhhvag56io4jm-NONE`). Each
+environment is a separate AWS account today, so `*<TableName>*` only
+matches that env's table. **If we ever consolidate accounts** (single
+account hosting multiple environments), this scoping becomes too
+permissive and must be tightened to the SSM-bridged exact ARN. Tracked
+as a TODO comment in the IAM policy file alongside the resource block.
+
+**SES `Condition: ses:FromAddress`** (Tomás §10 R2): the `ses:SendEmail`
+grant carries an explicit `Condition` block constraining the from-address
+to `noreply@<env-domain>`. Belt-and-braces against a bug that would
+otherwise let the Lambda send from any address under the verified
+domain (e.g. `support@`, `compliance@`). The grant covers
+`ses:SendEmail` only (not `ses:SendRawEmail`); PAY-21's email-template
+work — including any attachment-bearing emails — owns its own grant
+expansion. Bounce/complaint configuration is also PAY-21's concern, not
+this handler's.
 
 ## 8. Test coverage matrix
 
@@ -291,11 +367,56 @@ four resource ARNs above must be allowed for their respective actions).
 | 13 | `stripe trigger payment_intent.succeeded` against dev sandbox            | smoke   |
 | 14 | `stripe trigger payment_intent.payment_failed` against dev sandbox       | smoke   |
 | 15 | Replay smoke (run #13 twice) — assert single UserInvestment row created  | smoke   |
+| 16 | `event.data.object.id` missing/null → log + return, no write (Tomás §10 M4)            | unit |
+| 17 | `event.created` missing/zero → log warn + fallback to `Instant.now()` for AuditLog timestamp (Tomás §10 M4) | unit |
 
-Phase 1 hits 12 unit + 3 smoke = 15 cases. PAY-05 acceptance criteria
-require ≥ 6 negative paths; cases 4–11 cover 8.
+Phase 1 hits 14 unit + 3 smoke = 17 cases. PAY-05 acceptance criteria
+require ≥ 6 negative paths; cases 4–11, 16, 17 cover 10.
 
-## 9. Out-of-scope for PAY-05
+## 9. Tomás's design review (2026-05-03) — folded in
+
+Verdict: **APPROVE WITH AMENDMENTS** for the Phase-2 (handler-bodies)
+MR. None of the items below blocked the scaffold MR's merge — the
+scaffold ships pure routing infrastructure (dispatcher refactor +
+EventHandler interface + skeleton handlers) with no IAM, no DDB
+writes, no behaviour change vs PAY-02. Tomás's APPROVE on the
+scaffold is unconditional. The amendments below shape the Phase-2 MR
+that follows.
+
+### 9.1 Mandatory (blocking the Phase-2 MR)
+
+| # | Title | Folded into |
+|---|-------|-------------|
+| **M1** | `lastPaymentError.message` is raw Stripe-supplied data — cap, sanitize, log only Stripe's `errorCode` not the raw message | §4.2 step 3 + persist contract |
+| **M2** | Add `receivedAt` (Lambda wall-clock) to `AuditLog.details`; keep `timestamp` = `event.created` (Stripe-attestable) | §5 details JSON shape + rationale |
+| **M3** | CloudWatch alarm on `WebhookEvent.processed = false` count > 0 for >5 min — make the dashboard query an alarm, not just a panel | §6 + Phase-2b infrastructure MR |
+| **M4** | Add tests 16 + 17 — defensive event-shape (missing `event.data.object.id`; missing `event.created`) | §8 test matrix |
+
+### 9.2 Recommended (non-blocking)
+
+| # | Title | Folded into |
+|---|-------|-------------|
+| **R1** | Document IAM wildcard-ARN scoping assumption (per-env separate AWS accounts make `*<TableName>*` safe TODAY) — TODO comment for "consolidate accounts" change | §7 wildcard-ARN scoping note |
+| **R2** | SES `Resource = arn:aws:ses:eu-west-1:<acct>:identity/<from-domain>` PLUS `Condition: ses:FromAddress = "noreply@<env-domain>"`; grant covers `SendEmail` only (PAY-21 owns `SendRawEmail`/bounce/complaint) | §7 SES `Condition: ses:FromAddress` note |
+| **R3** | Bake `lambdaVersion` (image tag) and `gitSha` into `AuditLog.details` for forensic correlation | §5 details JSON shape (`lambdaVersion`, `gitSha`) |
+| **R4** | Phase-2 MR catch must be `ConditionalCheckFailedException`-specific (NOT `catch (Exception e)`) — distinct paths for guard violations vs real bugs | §6 catch specificity note |
+
+### 9.3 Cross-track interactions Tomás flagged
+
+- **PAY-23 PII CMK constraint:** PAY-05 must NOT touch `InvestorIban`
+  or the PII CMK. Phase 2 doesn't need IBAN reads (distribution flows
+  are Phase 2 / EPIC-PAYOUT). If Phase 2 ever surfaces a need, route
+  the diff through Tomás first.
+- **PAY-09 BLoC enum:** Rui-flutter's PaymentBloc has an exhaustive
+  switch on `ReservationStatus`. Phase 2 doesn't add new enum values
+  (it writes the existing `executed` / `failed` / `expired` /
+  `success` states the schema already declares), so no SendMessage to
+  Rui-flutter needed. Pin this assumption with a unit test that
+  asserts the handler writes only the documented status values.
+- **PAY-22 (when spawned):** has its own 9-item §12.4 design checklist
+  that Tomás is gating; orthogonal to PAY-05.
+
+## 10. Out-of-scope for PAY-05
 
 - Localised email template / pt-PT copy → **PAY-21**.
 - Real-time Flutter `PaymentBloc` subscription updates → **PAY-09**
