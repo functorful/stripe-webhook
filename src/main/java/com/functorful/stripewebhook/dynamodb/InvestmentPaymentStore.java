@@ -1,7 +1,6 @@
 package com.functorful.stripewebhook.dynamodb;
 
 import com.functorful.stripewebhook.reservation.ReservationKey;
-import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -30,12 +29,12 @@ import java.util.Optional;
  * is just a couple of RCUs more per call.
  *
  * <p><strong>GSI name override:</strong> Amplify Gen-2 generates GSIs
- * for {@code belongsTo} relations with a stable but verbose name. We
- * read the index name from {@code investment-payment.byReservation-index-name}
+ * for {@code belongsTo} relations with a stable but verbose name. The
+ * index name is bound through {@link InvestmentPaymentProperties}
  * (default {@code "investmentPaymentByReservation"}) so operators can
- * adjust if the Amplify-generated name diverges from the default. A
- * smoke-test failure on this lookup is recoverable without a code
- * deploy by re-pointing the env var.
+ * adjust without a code deploy if the Amplify-generated name diverges
+ * from the default. A smoke-test failure on this lookup is recoverable
+ * by re-pointing the env var.
  *
  * <p>Schema fields surfaced (all read-only on lookup):
  * id, version, userId, amountCents, currency, stripePaymentIntentId,
@@ -68,13 +67,11 @@ public class InvestmentPaymentStore {
 
     public InvestmentPaymentStore(
             DynamoDbClient dynamoDbClient,
-            @Value("${investment-payment.table-name}") String tableName,
-            @Value("${investment-payment.by-reservation-index-name:investmentPaymentByReservation}")
-                    String byReservationIndexName
+            InvestmentPaymentProperties properties
     ) {
         this.dynamoDbClient = dynamoDbClient;
-        this.tableName = tableName;
-        this.byReservationIndexName = byReservationIndexName;
+        this.tableName = properties.getTableName();
+        this.byReservationIndexName = properties.getByReservationIndexName();
     }
 
     /** Visible for testing. */
