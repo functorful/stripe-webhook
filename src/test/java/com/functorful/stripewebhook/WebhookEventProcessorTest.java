@@ -3,6 +3,8 @@ package com.functorful.stripewebhook;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
+import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import org.mockito.ArgumentCaptor;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore.RecordResult;
 import com.functorful.stripewebhook.secret.StripeWebhookSigningSecret;
@@ -80,7 +82,10 @@ class WebhookEventProcessorTest {
         assertThat(response.getStatusCode()).isEqualTo(200);
         assertThat(response.getBody()).contains("\"received\":true");
         verify(idempotencyStore, times(1)).recordFirstDelivery(eq(EVENT_ID), eq("stripe"), eq(FIXED_NOW));
-        verify(dispatcher, times(1)).dispatch(EVENT_TYPE, EVENT_ID);
+        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        verify(dispatcher, times(1)).dispatch(captor.capture());
+        assertThat(captor.getValue().eventId()).isEqualTo(EVENT_ID);
+        assertThat(captor.getValue().eventType()).isEqualTo(EVENT_TYPE);
     }
 
     @Test
@@ -94,7 +99,47 @@ class WebhookEventProcessorTest {
         APIGatewayV2HTTPResponse response = processor.process(event);
 
         assertThat(response.getStatusCode()).isEqualTo(200);
-        verify(dispatcher, never()).dispatch(any(), any());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    void invalidSignatureLogPathDoesNotEchoRequestBody() {
+        // Tomás's PAY-05 pre-flight ask: confirm the signature-rejection
+        // log path does NOT echo the request body. An attacker probing
+        // with crafted JSON could otherwise harvest log content.
+        //
+        // The processor logs only InvalidSignatureException.getMessage()
+        // and StripeSignatureVerifier#verify is the only producer of that
+        // message — we assert it stays parameterised and never includes
+        // the rawBody string. Since the message is a constructor-time
+        // value, the contract is structurally safe; this test is the
+        // belt-and-braces regression guard against future log-statement
+        // edits in the catch block.
+        ch.qos.logback.classic.Logger root =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(WebhookEventProcessor.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        root.addAppender(appender);
+        try {
+            String secretBody = "{\"id\":\"" + EVENT_ID + "\","
+                    + "\"type\":\"" + EVENT_TYPE + "\","
+                    + "\"data\":{\"object\":{\"secret_canary\":\"DO_NOT_LOG_ME_42\"}}}";
+            APIGatewayV2HTTPEvent event = httpEventWithBody(secretBody,
+                    "t=" + FIXED_NOW_EPOCH + ",v1=00000000000000000000000000000000");
+
+            processor.process(event);
+
+            for (ch.qos.logback.classic.spi.ILoggingEvent log : appender.list) {
+                String formatted = log.getFormattedMessage();
+                assertThat(formatted)
+                        .as("log line %s must not echo request body", formatted)
+                        .doesNotContain("DO_NOT_LOG_ME_42")
+                        .doesNotContain("secret_canary");
+            }
+        } finally {
+            root.detachAppender(appender);
+        }
     }
 
     @Test
@@ -108,7 +153,7 @@ class WebhookEventProcessorTest {
         // Tomás's veto: generic message, no detail leakage.
         assertThat(response.getBody()).isEqualTo("{\"error\":\"invalid request\"}");
         verify(idempotencyStore, never()).recordFirstDelivery(any(), any(), any());
-        verify(dispatcher, never()).dispatch(any(), any());
+        verify(dispatcher, never()).dispatch(any());
     }
 
     @Test
@@ -184,7 +229,10 @@ class WebhookEventProcessorTest {
         APIGatewayV2HTTPResponse response = processor.process(event);
 
         assertThat(response.getStatusCode()).isEqualTo(200);
-        verify(dispatcher, times(1)).dispatch("customer.subscription.deleted", EVENT_ID);
+        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        verify(dispatcher, times(1)).dispatch(captor.capture());
+        assertThat(captor.getValue().eventType()).isEqualTo("customer.subscription.deleted");
+        assertThat(captor.getValue().eventId()).isEqualTo(EVENT_ID);
     }
 
     @Test
@@ -226,7 +274,7 @@ class WebhookEventProcessorTest {
         when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
                 .thenReturn(RecordResult.FIRST_DELIVERY);
         org.mockito.Mockito.doThrow(new RuntimeException("PAY-05 not implemented"))
-                .when(dispatcher).dispatch(any(), any());
+                .when(dispatcher).dispatch(any());
 
         APIGatewayV2HTTPEvent event = httpEventWithBody(VALID_BODY,
                 buildSignatureHeader(FIXED_NOW_EPOCH, VALID_BODY, SECRET_VALUE));
