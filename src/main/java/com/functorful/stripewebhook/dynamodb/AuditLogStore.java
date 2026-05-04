@@ -1,14 +1,13 @@
 package com.functorful.stripewebhook.dynamodb;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micronaut.context.annotation.Value;
+import io.micronaut.serde.ObjectMapper;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.Put;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -49,12 +48,21 @@ public class AuditLogStore {
     private final String tableName;
     private final ObjectMapper objectMapper;
 
-    public AuditLogStore(@Value("${audit-log.table-name}") String tableName) {
-        this(tableName, new ObjectMapper());
-    }
-
-    /** Test seam — injects a shared ObjectMapper for deterministic JSON ordering. */
-    AuditLogStore(String tableName, ObjectMapper objectMapper) {
+    /**
+     * @param tableName resolved from {@code audit-log.table-name} (env
+     *                  {@code AUDIT_LOG_TABLE_NAME}); fail-closed if the
+     *                  bean cannot resolve.
+     * @param objectMapper Micronaut Serde {@link ObjectMapper} — the
+     *                     framework-managed singleton, configured by the
+     *                     application context (Miguel review on PR #6).
+     *                     Replaces the previous {@code new ObjectMapper()}
+     *                     pattern that bypassed DI and constructed a
+     *                     fresh Jackson mapper per Lambda init.
+     */
+    public AuditLogStore(
+            @Value("${audit-log.table-name}") String tableName,
+            ObjectMapper objectMapper
+    ) {
         this.tableName = tableName;
         this.objectMapper = objectMapper;
     }
@@ -98,13 +106,13 @@ public class AuditLogStore {
                 .build();
     }
 
-    private String serializeDetails(ObjectNode details) {
+    private String serializeDetails(Map<String, Object> details) {
         try {
             return objectMapper.writeValueAsString(details);
-        } catch (JsonProcessingException e) {
-            // Should never happen for an in-memory ObjectNode; if it
-            // does, fall back to an empty object so the audit row is
-            // still written rather than failing the whole transaction.
+        } catch (IOException e) {
+            // Should never happen for an in-memory Map<String, Object>;
+            // if it does, fall back to an empty object so the audit row
+            // is still written rather than failing the whole transaction.
             log.error("Failed to serialize AuditLog details; writing empty object. errorClass={}",
                     e.getClass().getSimpleName(), e);
             return "{}";
@@ -112,11 +120,17 @@ public class AuditLogStore {
     }
 
     /**
-     * Audit entry payload. {@link #details} is built by the handler
-     * and includes the per-PAY-05-§5 fields: provider, actor,
+     * Audit entry payload. {@link #details} is built by the handler as a
+     * {@code Map<String, Object>} (use {@link LinkedHashMap} for
+     * deterministic field ordering — JSON consumers don't care, but it
+     * keeps log diffs stable across runs). The map is serialised by
+     * Micronaut Serde via the injected {@link ObjectMapper}; nested
+     * objects are themselves {@code Map<String, Object>}.
+     *
+     * <p>Standard fields per PAY-05 design §5: provider, actor,
      * lambdaVersion, gitSha, eventId, stripePaymentIntentId,
-     * paymentRowId, paymentRowVersion, receivedAt, reservationKey,
-     * amountCents, currency, transition, plus
+     * paymentRowId, paymentRowVersion, receivedAt, reservationKey
+     * (nested), amountCents, currency, transition (nested), plus
      * lastPaymentErrorCode / lastPaymentError on failures.
      */
     public record Entry(
@@ -124,6 +138,6 @@ public class AuditLogStore {
             Instant timestamp,
             String resource,
             String action,
-            ObjectNode details
+            Map<String, Object> details
     ) {}
 }

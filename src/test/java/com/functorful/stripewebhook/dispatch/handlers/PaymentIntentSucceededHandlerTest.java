@@ -89,7 +89,6 @@ class PaymentIntentSucceededHandlerTest {
         handler = new PaymentIntentSucceededHandler(
                 reservationStore, paymentStore, userInvestmentStore,
                 auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
-                new ObjectMapper(),
                 "v0.0.5", "abc123",
                 "AuditLog-test-table"
         );
@@ -330,7 +329,7 @@ class PaymentIntentSucceededHandlerTest {
         PaymentIntentSucceededHandler degradedHandler = new PaymentIntentSucceededHandler(
                 reservationStore, paymentStore, userInvestmentStore,
                 auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
-                new ObjectMapper(), "v0.0.5", "abc123",
+                "v0.0.5", "abc123",
                 "PENDING_AUDIT_LOG_BRIDGE"
         );
 

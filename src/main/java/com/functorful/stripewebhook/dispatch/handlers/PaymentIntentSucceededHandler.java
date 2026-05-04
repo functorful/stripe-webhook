@@ -1,8 +1,6 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.functorful.stripewebhook.dispatch.EventHandler;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
@@ -28,7 +26,9 @@ import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledExcepti
 import software.amazon.awssdk.services.dynamodb.model.Update;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -103,7 +103,6 @@ public class PaymentIntentSucceededHandler implements EventHandler {
     private final SesEmailService sesEmailService;
     private final WebhookIdempotencyStore idempotencyStore;
     private final DynamoDbClient dynamoDbClient;
-    private final ObjectMapper objectMapper;
     private final String lambdaVersion;
     private final String gitSha;
     private final boolean degradedMode;
@@ -120,25 +119,6 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             @Value("${git.sha:unknown}") String gitSha,
             @Value("${audit-log.table-name}") String auditLogTableName
     ) {
-        this(reservationStore, paymentStore, userInvestmentStore, auditLogStore,
-                sesEmailService, idempotencyStore, dynamoDbClient, new ObjectMapper(),
-                lambdaVersion, gitSha, auditLogTableName);
-    }
-
-    /** Test seam — injects an ObjectMapper for deterministic JSON ordering. */
-    PaymentIntentSucceededHandler(
-            InvestmentReservationStore reservationStore,
-            InvestmentPaymentStore paymentStore,
-            UserInvestmentStore userInvestmentStore,
-            AuditLogStore auditLogStore,
-            SesEmailService sesEmailService,
-            WebhookIdempotencyStore idempotencyStore,
-            DynamoDbClient dynamoDbClient,
-            ObjectMapper objectMapper,
-            String lambdaVersion,
-            String gitSha,
-            String auditLogTableName
-    ) {
         this.reservationStore = reservationStore;
         this.paymentStore = paymentStore;
         this.userInvestmentStore = userInvestmentStore;
@@ -146,7 +126,6 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         this.sesEmailService = sesEmailService;
         this.idempotencyStore = idempotencyStore;
         this.dynamoDbClient = dynamoDbClient;
-        this.objectMapper = objectMapper;
         this.lambdaVersion = lambdaVersion;
         this.gitSha = gitSha;
         this.degradedMode = AUDIT_LOG_BRIDGE_PENDING_SENTINEL.equals(auditLogTableName);
@@ -247,7 +226,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
                 reservationKey.investmentVersion(),
                 reservation.participations(),
                 now);
-        ObjectNode details = buildAuditDetails(
+        Map<String, Object> details = buildAuditDetails(
                 event, paymentIntentId, payment, reservationKey,
                 receivedAt,
                 /* lastPaymentErrorCode */ null,
@@ -314,7 +293,15 @@ public class PaymentIntentSucceededHandler implements EventHandler {
                 RESERVATION_EXPECTED, RESERVATION_TARGET);
     }
 
-    private ObjectNode buildAuditDetails(
+    /**
+     * Build the AuditLog `details` payload as a {@link LinkedHashMap}
+     * so insertion order is preserved (stable JSON serialisation makes
+     * log diffs across runs trivially comparable). Nested objects
+     * ({@code reservationKey}, {@code transition}) are themselves
+     * {@code LinkedHashMap<String, Object>}; Micronaut Serde walks the
+     * map shape and emits the corresponding nested JSON.
+     */
+    private Map<String, Object> buildAuditDetails(
             StripeWebhookEvent event,
             String paymentIntentId,
             PaymentView payment,
@@ -325,7 +312,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             String paymentTransition,
             String reservationTransition
     ) {
-        ObjectNode details = objectMapper.createObjectNode();
+        Map<String, Object> details = new LinkedHashMap<>();
         details.put("provider", "stripe");
         details.put("actor", "stripe-webhook-lambda");
         details.put("lambdaVersion", lambdaVersion);
@@ -335,17 +322,19 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         details.put("paymentRowId", payment.id());
         details.put("paymentRowVersion", payment.version());
         details.put("receivedAt", receivedAt.toString());
-        ObjectNode keyNode = details.putObject("reservationKey");
+        Map<String, Object> keyNode = new LinkedHashMap<>();
         keyNode.put("userId", reservationKey.userId());
         keyNode.put("investmentId", reservationKey.investmentId());
         keyNode.put("investmentVersion", reservationKey.investmentVersion());
         keyNode.put("requestedAt", reservationKey.requestedAt());
         keyNode.put("version", reservationKey.version());
+        details.put("reservationKey", keyNode);
         details.put("amountCents", payment.amountCents());
         details.put("currency", payment.currency());
-        ObjectNode transition = details.putObject("transition");
+        Map<String, Object> transition = new LinkedHashMap<>();
         transition.put("payment", paymentTransition);
         transition.put("reservation", reservationTransition);
+        details.put("transition", transition);
         if (lastPaymentErrorCode != null) {
             details.put("lastPaymentErrorCode", lastPaymentErrorCode);
         }
