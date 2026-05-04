@@ -90,7 +90,8 @@ class PaymentIntentSucceededHandlerTest {
                 reservationStore, paymentStore, userInvestmentStore,
                 auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
                 new ObjectMapper(),
-                "v0.0.5", "abc123"
+                "v0.0.5", "abc123",
+                "AuditLog-test-table"
         );
     }
 
@@ -313,6 +314,38 @@ class PaymentIntentSucceededHandlerTest {
 
         verify(dynamoDbClient).transactWriteItems((TransactWriteItemsRequest) any());
         verify(sesEmailService, never()).sendPaymentConfirmation(any(), anyLong(), anyLong(), any());
+    }
+
+    // ------------------------------------------------------------
+    // Tomás M-NEW-1 (infrastructure!14): degraded-mode short-circuit
+    // when AUDIT_LOG_TABLE_NAME is the SSM-bridge sentinel
+    // ("PENDING_AUDIT_LOG_BRIDGE"). Required because, without the short-
+    // circuit, the 4-item TWI runs against a non-existent AuditLog table
+    // → DDB cancels the entire transaction → all 4 writes (payment +
+    // reservation + UserInvestment + AuditLog) atomically roll back →
+    // Stripe gets 200 → silent payment data loss.
+    // ------------------------------------------------------------
+    @Test
+    void degradedMode_doesNotTouchDdbAndDoesNotMarkProcessed() {
+        PaymentIntentSucceededHandler degradedHandler = new PaymentIntentSucceededHandler(
+                reservationStore, paymentStore, userInvestmentStore,
+                auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
+                new ObjectMapper(), "v0.0.5", "abc123",
+                "PENDING_AUDIT_LOG_BRIDGE"
+        );
+
+        degradedHandler.handle(newEvent("investor@example.com"));
+
+        // No DDB calls — neither loads nor writes.
+        verify(reservationStore, never()).load(any());
+        verify(paymentStore, never()).findByReservationAndIntent(any(), any());
+        verify(dynamoDbClient, never()).transactWriteItems((TransactWriteItemsRequest) any());
+
+        // No SES, no markProcessed (so the row stays processed=false
+        // and the M3 partial-coverage alarm fires on the "DEGRADED MODE"
+        // canary).
+        verify(sesEmailService, never()).sendPaymentConfirmation(any(), anyLong(), anyLong(), any());
+        verify(idempotencyStore, never()).markProcessed(any());
     }
 
     // --- helpers ---

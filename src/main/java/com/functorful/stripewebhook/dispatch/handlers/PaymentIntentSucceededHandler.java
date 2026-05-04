@@ -71,6 +71,31 @@ public class PaymentIntentSucceededHandler implements EventHandler {
     private static final String AUDIT_RESOURCE_PREFIX = "InvestmentReservation:";
     private static final String AUDIT_ACTION_SUCCEEDED = "payment.succeeded";
 
+    /**
+     * Sentinel value Tofu writes into {@code AUDIT_LOG_TABLE_NAME} when
+     * {@code var.audit_log_ssm_bridge_ready = false} — i.e. when the
+     * application repo's Amplify {@code tablesToExport} hasn't yet
+     * exported the AuditLog table name to SSM. Tomás's M-NEW-1 review
+     * (infrastructure!14) requires a degraded-mode short-circuit on this
+     * sentinel: without it, a 4-item TWI runs against a non-existent
+     * table, all 4 writes roll back atomically, Stripe gets 200, and
+     * Sobrado has zero record of the payment.
+     *
+     * <p>String identity must match the Tofu literal in
+     * {@code aws-stripe-webhook-lambda.tofu} exactly.
+     */
+    static final String AUDIT_LOG_BRIDGE_PENDING_SENTINEL = "PENDING_AUDIT_LOG_BRIDGE";
+
+    /**
+     * Canary string for the M-NEW-1 alarm extension. The infra log
+     * metric filter alternation matches both {@code "M3 alarm will
+     * surface this"} (markProcessed-failed canary) and
+     * {@code "DEGRADED MODE"} (this handler's degraded short-circuit).
+     * String identity must stay coupled to the alarm-pattern literal in
+     * {@code aws-webhook-events-monitoring.tofu}.
+     */
+    private static final String DEGRADED_MODE_CANARY = "DEGRADED MODE";
+
     private final InvestmentReservationStore reservationStore;
     private final InvestmentPaymentStore paymentStore;
     private final UserInvestmentStore userInvestmentStore;
@@ -81,6 +106,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
     private final ObjectMapper objectMapper;
     private final String lambdaVersion;
     private final String gitSha;
+    private final boolean degradedMode;
 
     public PaymentIntentSucceededHandler(
             InvestmentReservationStore reservationStore,
@@ -91,11 +117,12 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
             @Value("${dd.version:unknown}") String lambdaVersion,
-            @Value("${git.sha:unknown}") String gitSha
+            @Value("${git.sha:unknown}") String gitSha,
+            @Value("${audit-log.table-name}") String auditLogTableName
     ) {
         this(reservationStore, paymentStore, userInvestmentStore, auditLogStore,
                 sesEmailService, idempotencyStore, dynamoDbClient, new ObjectMapper(),
-                lambdaVersion, gitSha);
+                lambdaVersion, gitSha, auditLogTableName);
     }
 
     /** Test seam — injects an ObjectMapper for deterministic JSON ordering. */
@@ -109,7 +136,8 @@ public class PaymentIntentSucceededHandler implements EventHandler {
             DynamoDbClient dynamoDbClient,
             ObjectMapper objectMapper,
             String lambdaVersion,
-            String gitSha
+            String gitSha,
+            String auditLogTableName
     ) {
         this.reservationStore = reservationStore;
         this.paymentStore = paymentStore;
@@ -121,11 +149,36 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         this.objectMapper = objectMapper;
         this.lambdaVersion = lambdaVersion;
         this.gitSha = gitSha;
+        this.degradedMode = AUDIT_LOG_BRIDGE_PENDING_SENTINEL.equals(auditLogTableName);
+        if (this.degradedMode) {
+            log.error("PAY-05 succeeded handler initialised in {} — AuditLog SSM bridge not ready "
+                            + "(audit-log.table-name=={}). All Stripe webhook events that would "
+                            + "otherwise dispatch will short-circuit BEFORE any DDB writes; "
+                            + "WebhookEvent rows stay processed=false so the M3 alarm fires.",
+                    DEGRADED_MODE_CANARY, AUDIT_LOG_BRIDGE_PENDING_SENTINEL);
+        }
     }
 
     @Override
     @NewSpan
     public void handle(StripeWebhookEvent event) {
+        // Tomás M-NEW-1 (infrastructure!14): when the AuditLog SSM bridge
+        // is not yet ready, AUDIT_LOG_TABLE_NAME collapses to the
+        // sentinel. Short-circuit BEFORE the TWI so we never run a
+        // 4-item transaction against a non-existent table — that path
+        // would silently drop the payment on the floor (entire TWI
+        // rolls back atomically, Stripe gets 200, no record in DDB).
+        if (degradedMode) {
+            log.error("PAY-05 handler in {} — AuditLog SSM bridge not ready. Skipping ALL writes; "
+                            + "webhook event recorded for replay after var.audit_log_ssm_bridge_ready "
+                            + "flips and the Lambda image rolls. eventId={} eventType={}",
+                    DEGRADED_MODE_CANARY, event.eventId(), event.eventType());
+            // Do NOT call markProcessed. Row stays processed=false so the
+            // M3 alarm fires (the partial-coverage log-metric-filter
+            // pattern includes "DEGRADED MODE" as a canary string).
+            return;
+        }
+
         Instant receivedAt = Instant.now();
 
         // 1. Extract paymentIntentId + reservation key from event payload.
