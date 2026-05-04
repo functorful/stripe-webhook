@@ -401,7 +401,13 @@ that follows.
 | **R3** | Bake `lambdaVersion` (image tag) and `gitSha` into `AuditLog.details` for forensic correlation | §5 details JSON shape (`lambdaVersion`, `gitSha`) |
 | **R4** | Phase-2 MR catch must be `ConditionalCheckFailedException`-specific (NOT `catch (Exception e)`) — distinct paths for guard violations vs real bugs | §6 catch specificity note |
 
-### 9.3 Cross-track interactions Tomás flagged
+### 9.3 Mandatory (added 2026-05-04 — blocking the Phase-2b deploy)
+
+| # | Title | Folded into |
+|---|-------|-------------|
+| **M-NEW-1** | Degraded-mode short-circuit when `AUDIT_LOG_TABLE_NAME` collapses to the `PENDING_AUDIT_LOG_BRIDGE` sentinel during the cross-repo apply window. Without it, the 3-/4-item `TransactWriteItems` runs against a non-existent AuditLog table, all writes roll back atomically, Stripe gets 200, and Sobrado has zero record of the payment — the silent-payment-data-loss class. | §11 below + handler `degradedMode` flag + `degradedMode_doesNotTouchDdbAndDoesNotMarkProcessed` unit test in both handler test classes + `aws-webhook-events-monitoring.tofu` log-metric-filter pattern alternation extension (`?"M3 alarm will surface this" ?"DEGRADED MODE"`) |
+
+### 9.4 Cross-track interactions Tomás flagged
 
 - **PAY-23 PII CMK constraint:** PAY-05 must NOT touch `InvestorIban`
   or the PII CMK. Phase 2 doesn't need IBAN reads (distribution flows
@@ -416,7 +422,57 @@ that follows.
 - **PAY-22 (when spawned):** has its own 9-item §12.4 design checklist
   that Tomás is gating; orthogonal to PAY-05.
 
-## 10. Out-of-scope for PAY-05
+## 11. Degraded-mode short-circuit (M-NEW-1)
+
+**Trigger:** `AUDIT_LOG_TABLE_NAME` env var equals the literal string
+`"PENDING_AUDIT_LOG_BRIDGE"` (Tofu's collapse value when
+`var.audit_log_ssm_bridge_ready = false`, see
+`infrastructure/modules/environment/aws-stripe-webhook-lambda.tofu`).
+
+**Posture:** at construction, both
+`PaymentIntentSucceededHandler` and `PaymentIntentFailedHandler` set
+`degradedMode = "PENDING_AUDIT_LOG_BRIDGE".equals(auditLogTableName)`
+and emit a startup ERROR log carrying the canary `"DEGRADED MODE"`.
+At dispatch, `handle(event)` short-circuits with another ERROR carrying
+the same canary AND the eventId / eventType, then returns. **No DDB
+reads, no DDB writes, no SES, no `markProcessed`.** The
+`WebhookEvent` row stays `processed = false` so the §6 / M3
+log-metric-filter alarm fires (extended pattern alternation:
+`?"M3 alarm will surface this" ?"DEGRADED MODE"`).
+
+**Why short-circuit and not "best-effort skip the AuditLog Put":**
+the AuditLog Put participates in the same `TransactWriteItems` as the
+payment + reservation + UserInvestment writes. If the AuditLog target
+table is missing, the entire transaction rolls back atomically — there
+is no "partial success" to reason about. Skipping the AuditLog Put
+inside the TWI would mean re-shaping the §4 contract per-event-type
+(deciding which writes to keep), which trades a clean atomicity story
+for a risky branching one. Short-circuiting at the handler entry point
+preserves the §4 invariant: when handlers run, they run their full
+contract or none of it.
+
+**Apply order (the only path out of degraded mode):**
+1. Application repo MR adds `"AuditLog"` to
+   `amplify/backend.ts:tablesToExport`, deploys.
+2. Set `var.audit_log_ssm_bridge_ready = true` in the infrastructure
+   repo's `secrets.auto.tfvars`; replan + reapply.
+3. Lambda env var resolves to the real AuditLog table name on the next
+   image roll. Degraded mode auto-clears at cold start.
+
+Sentinel string identity (`"PENDING_AUDIT_LOG_BRIDGE"`) is structurally
+coupled across:
+
+- `aws-stripe-webhook-lambda.tofu` Tofu literal (`AUDIT_LOG_TABLE_NAME`
+  collapse value),
+- both handler classes (`AUDIT_LOG_BRIDGE_PENDING_SENTINEL` constant +
+  `degradedMode` predicate),
+- `aws-webhook-events-monitoring.tofu` alarm `pattern` (alternation on
+  the `"DEGRADED MODE"` canary).
+
+Drift in any of those three locations silently breaks detection of the
+silent-payment-data-loss class. Code review must pin all three.
+
+## 12. Out-of-scope for PAY-05
 
 - Localised email template / pt-PT copy → **PAY-21**.
 - Real-time Flutter `PaymentBloc` subscription updates → **PAY-09**

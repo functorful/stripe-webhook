@@ -8,6 +8,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -85,6 +86,54 @@ public class WebhookIdempotencyStore {
         } catch (ConditionalCheckFailedException replay) {
             log.info("Webhook event replay detected; skipping. eventId={}", eventId);
             return RecordResult.REPLAY;
+        }
+    }
+
+    /**
+     * Mark a previously-recorded event row as fully processed (PAY-05).
+     * Called by the handlers after a successful business-state write
+     * (the {@code TransactWriteItems} + best-effort SES email).
+     *
+     * <p>Best-effort: this update is NOT critical for correctness —
+     * Stripe-side replays still short-circuit on
+     * {@code attribute_not_exists(eventId)} via
+     * {@link #recordFirstDelivery}, so leaving {@code processed=false}
+     * does not double-credit anything. The flag is purely an
+     * operator-readable signal that the row reached completion. The
+     * Phase-2b CloudWatch alarm (Tomás §10 M3) fires on
+     * {@code processed=false count > 0 for >5min}, which is the
+     * actionable signal — a stale {@code processed=false} surfaces
+     * either a Lambda crash mid-write, a partial-write recovery
+     * target, or a downstream-service failure.
+     *
+     * <p>Catches all exceptions and logs at WARN: a failure here must
+     * NOT propagate — the payment is already confirmed in DDB at this
+     * point, so the orchestrator must still return 200 to Stripe. The
+     * M3 alarm is the safety net for any row that lingers as a
+     * result.
+     *
+     * @param eventId the Stripe event id (the WebhookEvent partition key).
+     */
+    @NewSpan
+    public void markProcessed(String eventId) {
+        try {
+            UpdateItemRequest request = UpdateItemRequest.builder()
+                    .tableName(tableName)
+                    .key(Map.of("eventId", AttributeValue.fromS(eventId)))
+                    .updateExpression("SET #p = :true")
+                    .expressionAttributeNames(Map.of("#p", "processed"))
+                    .expressionAttributeValues(Map.of(":true", AttributeValue.fromBool(true)))
+                    .conditionExpression("attribute_exists(eventId)")
+                    .build();
+            dynamoDbClient.updateItem(request);
+        } catch (RuntimeException e) {
+            // Tomás §10 M3 safety net catches lingering processed=false
+            // rows, so a failure here is not silent — it surfaces
+            // operationally. Logging at WARN (not ERROR) because the
+            // business state is already correct.
+            log.warn("Failed to mark WebhookEvent processed; M3 alarm will surface this if "
+                            + "the row stays false for >5min. eventId={} errorClass={}",
+                    eventId, e.getClass().getSimpleName());
         }
     }
 
