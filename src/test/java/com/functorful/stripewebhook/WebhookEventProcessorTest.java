@@ -3,15 +3,19 @@ package com.functorful.stripewebhook;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
-import com.functorful.stripewebhook.event.StripeWebhookEvent;
-import org.mockito.ArgumentCaptor;
+import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore.RecordResult;
 import com.functorful.stripewebhook.secret.StripeWebhookSigningSecret;
 import com.functorful.stripewebhook.signature.StripeSignatureVerifier;
+import io.micronaut.context.ApplicationContext;
+import io.micronaut.serde.ObjectMapper;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -38,6 +42,18 @@ import static org.mockito.Mockito.when;
  * End-to-end (in-JVM) tests for the {@link WebhookEventProcessor}
  * orchestration. The processor is plain-Java; we construct it directly
  * with mocks rather than going through the Micronaut application context.
+ *
+ * <p>Post-ARCH-08: the processor parses the raw HTTP body via Micronaut
+ * Serde {@link ObjectMapper} into a typed
+ * {@link com.functorful.stripewebhook.event.wire.StripeEventEnvelope},
+ * then converts to a {@link StripeEvent} variant. Tests assert the
+ * dispatcher receives the typed variant; per-handler behaviour is covered
+ * in their own unit tests.
+ *
+ * <p>The test brings up a minimal Micronaut {@link ApplicationContext} once
+ * to obtain a real Serde {@link ObjectMapper} bean — the @Serdeable
+ * processor is annotation-processor-generated, so an in-process
+ * {@code new ObjectMapper()} would not register the typed deserialisers.
  */
 @ExtendWith(MockitoExtension.class)
 class WebhookEventProcessorTest {
@@ -49,7 +65,26 @@ class WebhookEventProcessorTest {
     private static final String EVENT_ID = "evt_test_1";
     private static final String EVENT_TYPE = "payment_intent.succeeded";
     private static final String VALID_BODY =
-            "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\",\"data\":{}}";
+            "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\","
+                    + "\"data\":{\"object\":{\"id\":\"pi_test\"}}}";
+
+    private static ApplicationContext applicationContext;
+    private static ObjectMapper objectMapper;
+
+    @BeforeAll
+    static void bootSerdeContext() {
+        // Real Serde ObjectMapper from Micronaut context — required for
+        // @Serdeable annotation-processor-generated deserialisers.
+        applicationContext = ApplicationContext.builder().deduceEnvironment(false).start();
+        objectMapper = applicationContext.getBean(ObjectMapper.class);
+    }
+
+    @AfterAll
+    static void shutdownSerdeContext() {
+        if (applicationContext != null) {
+            applicationContext.close();
+        }
+    }
 
     @Mock
     WebhookIdempotencyStore idempotencyStore;
@@ -66,11 +101,12 @@ class WebhookEventProcessorTest {
         fixedClock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         verifier = new StripeSignatureVerifier(fixedClock);
         signingSecret = new StripeWebhookSigningSecret(SECRET_VALUE, SECRET_ARN);
-        processor = new WebhookEventProcessor(verifier, signingSecret, idempotencyStore, dispatcher, fixedClock);
+        processor = new WebhookEventProcessor(
+                verifier, signingSecret, idempotencyStore, dispatcher, objectMapper, fixedClock);
     }
 
     @Test
-    void validSignatureAndFirstDeliveryReturns200AndWritesIdempotencyRecord() {
+    void validSignatureAndFirstDeliveryReturns200AndDispatchesTypedSucceededVariant() {
         when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
                 .thenReturn(RecordResult.FIRST_DELIVERY);
 
@@ -82,10 +118,12 @@ class WebhookEventProcessorTest {
         assertThat(response.getStatusCode()).isEqualTo(200);
         assertThat(response.getBody()).contains("\"received\":true");
         verify(idempotencyStore, times(1)).recordFirstDelivery(eq(EVENT_ID), eq("stripe"), eq(FIXED_NOW));
-        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        ArgumentCaptor<StripeEvent> captor = ArgumentCaptor.forClass(StripeEvent.class);
         verify(dispatcher, times(1)).dispatch(captor.capture());
+        assertThat(captor.getValue())
+                .as("payment_intent.succeeded body must dispatch as PaymentIntentSucceeded variant")
+                .isInstanceOf(StripeEvent.PaymentIntentSucceeded.class);
         assertThat(captor.getValue().eventId()).isEqualTo(EVENT_ID);
-        assertThat(captor.getValue().eventType()).isEqualTo(EVENT_TYPE);
     }
 
     @Test
@@ -107,14 +145,6 @@ class WebhookEventProcessorTest {
         // Tomás's PAY-05 pre-flight ask: confirm the signature-rejection
         // log path does NOT echo the request body. An attacker probing
         // with crafted JSON could otherwise harvest log content.
-        //
-        // The processor logs only InvalidSignatureException.getMessage()
-        // and StripeSignatureVerifier#verify is the only producer of that
-        // message — we assert it stays parameterised and never includes
-        // the rawBody string. Since the message is a constructor-time
-        // value, the contract is structurally safe; this test is the
-        // belt-and-braces regression guard against future log-statement
-        // edits in the catch block.
         ch.qos.logback.classic.Logger root =
                 (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(WebhookEventProcessor.class);
         ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
@@ -205,7 +235,7 @@ class WebhookEventProcessorTest {
 
     @Test
     void bodyWithoutEventIdReturns400() {
-        String body = "{\"type\":\"payment_intent.succeeded\"}";
+        String body = "{\"type\":\"payment_intent.succeeded\",\"created\":1234567890}";
         APIGatewayV2HTTPEvent event = httpEventWithBody(body,
                 buildSignatureHeader(FIXED_NOW_EPOCH, body, SECRET_VALUE));
 
@@ -220,16 +250,12 @@ class WebhookEventProcessorTest {
         // Tomás §10 M4 case 17: a body that passed HMAC verification +
         // JSON parse + has an event.id but is missing `event.created`
         // (or has a non-numeric value) must NOT crash. The processor
-        // falls back to the receiver clock for the StripeWebhookEvent's
-        // `created` Instant. Handlers that pin `AuditLog.timestamp` to
-        // `event.created` will then write the receiver clock — slightly
+        // falls back to the receiver clock for the StripeEvent's
+        // `occurredAt` Instant. Handlers that pin `AuditLog.timestamp` to
+        // `event.occurredAt` will then write the receiver clock — slightly
         // less forensically clean than Stripe-attestable, but correct.
-        //
-        // This is the structural protection for the case 17 invariant;
-        // the regression guard is the assertion that the dispatcher
-        // receives a non-null + non-zero Instant.
         String bodyNoCreated = "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\","
-                + "\"data\":{\"object\":{}}}"; // no `created` field
+                + "\"data\":{\"object\":{\"id\":\"pi_test\"}}}"; // no `created`
         when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
                 .thenReturn(RecordResult.FIRST_DELIVERY);
 
@@ -239,41 +265,23 @@ class WebhookEventProcessorTest {
         APIGatewayV2HTTPResponse response = processor.process(event);
 
         assertThat(response.getStatusCode()).isEqualTo(200);
-        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        ArgumentCaptor<StripeEvent> captor = ArgumentCaptor.forClass(StripeEvent.class);
         verify(dispatcher, times(1)).dispatch(captor.capture());
-        StripeWebhookEvent dispatched = captor.getValue();
-        assertThat(dispatched.created())
+        StripeEvent dispatched = captor.getValue();
+        assertThat(dispatched.occurredAt())
                 .as("missing event.created falls back to receiver clock; never null, never epoch zero")
                 .isNotNull()
                 .isEqualTo(FIXED_NOW); // the test's fixed clock
     }
 
     @Test
-    void nonNumericEventCreatedFallsBackToReceiverClock() {
-        // Sibling of case 17: `created` present but not a number (Stripe
-        // shouldn't ever do this, but the parser must be defensive).
-        String bodyStringCreated = "{\"id\":\"" + EVENT_ID + "\",\"type\":\"" + EVENT_TYPE + "\","
-                + "\"created\":\"oops-not-a-number\","
-                + "\"data\":{\"object\":{}}}";
-        when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
-                .thenReturn(RecordResult.FIRST_DELIVERY);
-
-        APIGatewayV2HTTPEvent event = httpEventWithBody(bodyStringCreated,
-                buildSignatureHeader(FIXED_NOW_EPOCH, bodyStringCreated, SECRET_VALUE));
-
-        APIGatewayV2HTTPResponse response = processor.process(event);
-
-        assertThat(response.getStatusCode()).isEqualTo(200);
-        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
-        verify(dispatcher, times(1)).dispatch(captor.capture());
-        assertThat(captor.getValue().created()).isEqualTo(FIXED_NOW);
-    }
-
-    @Test
-    void unknownEventTypeStillReturns200AndRecordsAndDispatches() {
+    void unknownEventTypeStillReturns200AndDispatchesIgnoredVariant() {
         // Forward-compatible: receiving an event we don't recognise is
         // common (Stripe sends many types). PAY-02 acknowledges all.
-        String body = "{\"id\":\"" + EVENT_ID + "\",\"type\":\"customer.subscription.deleted\"}";
+        // Post-ARCH-08: dispatched as the typed Ignored variant.
+        String body = "{\"id\":\"" + EVENT_ID + "\","
+                + "\"type\":\"customer.subscription.deleted\","
+                + "\"data\":{\"object\":{}}}";
         when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
                 .thenReturn(RecordResult.FIRST_DELIVERY);
 
@@ -283,10 +291,14 @@ class WebhookEventProcessorTest {
         APIGatewayV2HTTPResponse response = processor.process(event);
 
         assertThat(response.getStatusCode()).isEqualTo(200);
-        ArgumentCaptor<StripeWebhookEvent> captor = ArgumentCaptor.forClass(StripeWebhookEvent.class);
+        ArgumentCaptor<StripeEvent> captor = ArgumentCaptor.forClass(StripeEvent.class);
         verify(dispatcher, times(1)).dispatch(captor.capture());
-        assertThat(captor.getValue().eventType()).isEqualTo("customer.subscription.deleted");
-        assertThat(captor.getValue().eventId()).isEqualTo(EVENT_ID);
+        assertThat(captor.getValue())
+                .as("unrecognised event type must dispatch as Ignored variant — first-class case, never null")
+                .isInstanceOfSatisfying(StripeEvent.Ignored.class, ignored -> {
+                    assertThat(ignored.eventId()).isEqualTo(EVENT_ID);
+                    assertThat(ignored.unrecognisedType()).isEqualTo("customer.subscription.deleted");
+                });
     }
 
     @Test

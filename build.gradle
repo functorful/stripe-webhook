@@ -80,11 +80,6 @@ dependencies {
     testImplementation("org.assertj:assertj-core:3.27.7")
     testImplementation("org.assertj:assertj-vavr:0.4.3")
     testImplementation("software.amazon.awssdk:sts")
-    // Jackson is INTENTIONALLY ABSENT from production (ADR-0008). Micronaut
-    // Serde provides typed JSON binding via @Serdeable records. Tests may
-    // still need raw JSON manipulation for fixture authoring; this is the
-    // only allowed Jackson surface in the project.
-    testImplementation("com.fasterxml.jackson.core:jackson-databind")
     // Logback is `runtimeOnly` for the production image; expose it to test
     // compile so tests can attach a ListAppender to assert structured-log
     // behavior on the cold-start sentinel path.
