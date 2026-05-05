@@ -157,6 +157,17 @@ public class WebhookEventProcessor {
      * one new {@link StripeEvent} variant + one new dispatcher case (the
      * dispatcher's switch is exhaustive; the build fails until the case
      * is added).
+     *
+     * <p><strong>One-way mapping invariant.</strong> A {@link StripeEvent}
+     * returned from this method MUST NOT be re-promoted to a typed variant
+     * downstream — the variant returned is the final routing decision.
+     * Specifically: if this method returns {@link StripeEvent.Ignored}
+     * (because of unknown type, null type, or missing {@code data.object}),
+     * downstream code (dispatcher, handlers, ops tooling) must treat it as
+     * Ignored. Any "if Ignored.unrecognisedType equals X then upgrade to Y"
+     * shape downstream defeats the gadget-defence sealed-hierarchy
+     * property; the dispatcher would end up routing on attacker-influenced
+     * wire data via a string side-channel.
      */
     static StripeEvent toStripeEvent(StripeEventEnvelope envelope, Instant fallbackOccurredAt) {
         Instant occurredAt = envelope.created() > 0

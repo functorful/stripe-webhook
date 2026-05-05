@@ -44,6 +44,23 @@ jobs:
           fi
           echo "✓ No direct Jackson references in production code."
 
+      - name: ADR-0008 — StripeEvent.Ignored.unrecognisedType is debug-only
+        if: matrix.flavor == 'vanilla'
+        run: |
+          # The Ignored variant carries `unrecognisedType` for forensics-trace
+          # logging only — branching on it downstream would re-introduce a
+          # string-side-channel routing path that defeats the sealed-hierarchy
+          # gadget-defence property. The ONLY allowed call site is
+          # WebhookEventDispatcher's handleIgnored helper (logs the value at
+          # info level, never branches).
+          OFFENDERS=$(grep -rnE '\.unrecognisedType\(\)' src/main --include='*.java' | grep -v 'WebhookEventDispatcher.java' || true)
+          if [ -n "$OFFENDERS" ]; then
+            echo "::error::StripeEvent.Ignored.unrecognisedType() called outside WebhookEventDispatcher (forbidden — debug-only field; see ADR-0008):"
+            echo "$OFFENDERS"
+            exit 1
+          fi
+          echo "✓ Ignored.unrecognisedType() restricted to WebhookEventDispatcher."
+
       - name: Build and test (vanilla only)
         if: matrix.flavor == 'vanilla'
         run: ./gradlew --build-cache build
