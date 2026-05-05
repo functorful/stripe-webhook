@@ -1,5 +1,6 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
+import com.functorful.stripewebhook.config.BuildMetadataProperties;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
@@ -62,6 +63,9 @@ class PaymentIntentSucceededHandlerTest {
     private static final long AMOUNT_CENTS = 50_000L;
     private static final Instant EVENT_CREATED = Instant.parse("2026-05-03T10:30:00Z");
 
+    private static final String LAMBDA_VERSION = "v0.0.5";
+    private static final String GIT_SHA = "abc123";
+
     private InvestmentReservationStore reservationStore;
     private InvestmentPaymentStore paymentStore;
     private UserInvestmentStore userInvestmentStore;
@@ -69,6 +73,7 @@ class PaymentIntentSucceededHandlerTest {
     private SesEmailService sesEmailService;
     private WebhookIdempotencyStore idempotencyStore;
     private DynamoDbClient dynamoDbClient;
+    private BuildMetadataProperties buildMetadata;
     private PaymentIntentSucceededHandler handler;
 
     @BeforeEach
@@ -94,16 +99,25 @@ class PaymentIntentSucceededHandlerTest {
         when(auditLogStore.buildPut(any()))
                 .thenReturn(Put.builder().tableName("audit-tbl").build());
 
+        buildMetadata = newBuildMetadata(LAMBDA_VERSION, GIT_SHA);
+
         handler = new PaymentIntentSucceededHandler(
                 reservationStore, paymentStore, userInvestmentStore,
                 auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
-                "v0.0.5", "abc123",
+                buildMetadata,
                 "AuditLog-test-table"
         );
     }
 
     private static long anyLong() {
         return org.mockito.ArgumentMatchers.anyLong();
+    }
+
+    private static BuildMetadataProperties newBuildMetadata(String version, String gitSha) {
+        BuildMetadataProperties props = new BuildMetadataProperties();
+        props.setVersion(version);
+        props.setGitSha(gitSha);
+        return props;
     }
 
     // ------------------------------------------------------------
@@ -338,7 +352,7 @@ class PaymentIntentSucceededHandlerTest {
         PaymentIntentSucceededHandler degradedHandler = new PaymentIntentSucceededHandler(
                 reservationStore, paymentStore, userInvestmentStore,
                 auditLogStore, sesEmailService, idempotencyStore, dynamoDbClient,
-                "v0.0.5", "abc123",
+                buildMetadata,
                 "PENDING_AUDIT_LOG_BRIDGE"
         );
 
