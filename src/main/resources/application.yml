@@ -11,3 +11,12 @@ stripe:
 
 webhook-events:
   table-name: ${WEBHOOK_EVENTS_TABLE_NAME}
+
+# Build provenance — bound to the Datadog-convention env vars the
+# Dockerfile already sets (see build.gradle's `dockerEnv()` block).
+# Decoupled from the `dd.*` namespace so the application code reads
+# through the typed `BuildMetadataProperties` bean rather than the
+# Datadog APM tag namespace. See `BuildMetadataProperties` Javadoc.
+build:
+  version: ${DD_VERSION:unknown}
+  git-sha: ${GIT_SHA:unknown}

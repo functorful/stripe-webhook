@@ -1,5 +1,6 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
+import com.functorful.stripewebhook.config.BuildMetadataProperties;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
@@ -97,8 +98,7 @@ public class PaymentIntentFailedHandler {
             AuditLogStore auditLogStore,
             WebhookIdempotencyStore idempotencyStore,
             DynamoDbClient dynamoDbClient,
-            @Value("${dd.version:unknown}") String lambdaVersion,
-            @Value("${git.sha:unknown}") String gitSha,
+            BuildMetadataProperties buildMetadata,
             @Value("${audit-log.table-name}") String auditLogTableName
     ) {
         this.reservationStore = reservationStore;
@@ -106,8 +106,11 @@ public class PaymentIntentFailedHandler {
         this.auditLogStore = auditLogStore;
         this.idempotencyStore = idempotencyStore;
         this.dynamoDbClient = dynamoDbClient;
-        this.lambdaVersion = lambdaVersion;
-        this.gitSha = gitSha;
+        // Copy at construction — same shape as InvestmentPaymentStore (the
+        // canonical ARCH-09 properties-bean idiom). Stable strings throughout
+        // the Lambda's lifetime; no need to retain the properties bean.
+        this.lambdaVersion = buildMetadata.getVersion();
+        this.gitSha = buildMetadata.getGitSha();
         this.degradedMode = AUDIT_LOG_BRIDGE_PENDING_SENTINEL.equals(auditLogTableName);
         if (this.degradedMode) {
             log.error("PAY-05 failed handler initialised in {} — AuditLog SSM bridge not ready "
