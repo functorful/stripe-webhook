@@ -2,20 +2,20 @@ package com.functorful.stripewebhook;
 
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.MissingNode;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
-import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.event.StripeEvent;
+import com.functorful.stripewebhook.event.wire.StripeEventEnvelope;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore.RecordResult;
 import com.functorful.stripewebhook.secret.StripeWebhookSigningSecret;
 import com.functorful.stripewebhook.signature.InvalidSignatureException;
 import com.functorful.stripewebhook.signature.StripeSignatureVerifier;
+import io.micronaut.serde.ObjectMapper;
 import io.micronaut.tracing.annotation.NewSpan;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Map;
@@ -28,18 +28,49 @@ import java.util.Map;
  *
  * <p>See {@link FunctionRequestHandler} for the high-level flow
  * description.
+ *
+ * <p><strong>ADR-0008 boundary parser.</strong> This class is the single
+ * trust-boundary parser for inbound Stripe webhook bodies. It performs
+ * three layered checks, each fail-closed:
+ *
+ * <ol>
+ *   <li><strong>HMAC signature verification</strong> — invalid →
+ *       {@code 400 Bad Request}, no parse attempt. Defends against
+ *       attacker-controlled payloads even reaching the JSON parser.</li>
+ *   <li><strong>JSON shape via Micronaut Serde {@link ObjectMapper}</strong>
+ *       — parses the raw body into the typed {@link StripeEventEnvelope}.
+ *       A malformed-JSON or missing-required-field body raises a
+ *       {@code SerdeException} (or {@link IOException}); both collapse to
+ *       {@code 400 Bad Request}. The dispatcher only ever sees a
+ *       well-formed typed envelope.</li>
+ *   <li><strong>Type-discrimination switch</strong> —
+ *       {@link #toStripeEvent(StripeEventEnvelope, Instant)} maps the wire
+ *       {@code type} string to the matching {@link StripeEvent} variant.
+ *       Unrecognised types map to {@link StripeEvent.Ignored} (a
+ *       first-class variant — never a {@code null} from a map miss). The
+ *       dispatcher's switch then routes {@code Ignored} to the
+ *       ack-and-log-only branch.</li>
+ * </ol>
+ *
+ * <p><strong>No untyped {@code JsonNode}</strong> reaches the dispatcher
+ * or any handler. The handlers receive a typed
+ * {@link com.functorful.stripewebhook.event.PaymentIntentObject} payload
+ * directly; per-handler re-parsing of {@code data.object} is structurally
+ * impossible.
  */
 @Slf4j
 @Singleton
 public class WebhookEventProcessor {
 
     private static final String STRIPE_SIGNATURE_HEADER = "stripe-signature";
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final String EVENT_TYPE_PAYMENT_INTENT_SUCCEEDED = "payment_intent.succeeded";
+    private static final String EVENT_TYPE_PAYMENT_INTENT_FAILED = "payment_intent.payment_failed";
 
     private final StripeSignatureVerifier signatureVerifier;
     private final StripeWebhookSigningSecret signingSecret;
     private final WebhookIdempotencyStore idempotencyStore;
     private final WebhookEventDispatcher dispatcher;
+    private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public WebhookEventProcessor(
@@ -47,18 +78,20 @@ public class WebhookEventProcessor {
             StripeWebhookSigningSecret signingSecret,
             WebhookIdempotencyStore idempotencyStore,
             WebhookEventDispatcher dispatcher,
+            ObjectMapper objectMapper,
             Clock clock
     ) {
         this.signatureVerifier = signatureVerifier;
         this.signingSecret = signingSecret;
         this.idempotencyStore = idempotencyStore;
         this.dispatcher = dispatcher;
+        this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
-     * Verify → dedup → dispatch. See {@link FunctionRequestHandler} for
-     * the failure mapping.
+     * Verify → parse → dedup → dispatch. See {@link FunctionRequestHandler}
+     * for the failure mapping.
      */
     @NewSpan
     public APIGatewayV2HTTPResponse process(APIGatewayV2HTTPEvent input) {
@@ -75,29 +108,31 @@ public class WebhookEventProcessor {
             return badRequest();
         }
 
-        JsonNode root;
+        StripeEventEnvelope envelope;
         try {
-            root = OBJECT_MAPPER.readTree(rawBody);
-        } catch (RuntimeException | java.io.IOException e) {
-            log.warn("Stripe webhook body is not valid JSON. errorClass={}", e.getClass().getSimpleName());
+            envelope = objectMapper.readValue(rawBody, StripeEventEnvelope.class);
+        } catch (IOException | RuntimeException e) {
+            // Both io.micronaut.serde.exceptions.SerdeException and any
+            // wrapped IOException collapse here. Class name only — no
+            // message body in the log line (Stripe-supplied bytes that
+            // failed to parse may contain attacker-controlled fragments).
+            log.warn("Stripe webhook body failed Serde parse. errorClass={}",
+                    e.getClass().getSimpleName());
             return badRequest();
         }
 
-        String eventId = textOrNull(root, "id");
-        String eventType = textOrNull(root, "type");
-
-        if (eventId == null) {
-            log.warn("Stripe webhook body missing `id` field; rejecting.");
+        if (envelope.id() == null || envelope.id().isEmpty()) {
+            log.warn("Stripe webhook envelope missing `id` field; rejecting.");
             return badRequest();
         }
 
         Instant now = clock.instant();
-        RecordResult result = idempotencyStore.recordFirstDelivery(eventId, "stripe", now);
+        RecordResult result = idempotencyStore.recordFirstDelivery(envelope.id(), "stripe", now);
         if (result == RecordResult.REPLAY) {
             return ok();
         }
 
-        StripeWebhookEvent event = buildEvent(eventId, eventType, root, now);
+        StripeEvent event = toStripeEvent(envelope, now);
         try {
             dispatcher.dispatch(event);
         } catch (RuntimeException e) {
@@ -105,7 +140,7 @@ public class WebhookEventProcessor {
             // circuit. Don't 5xx Stripe (it would retry); don't leak
             // server-side error to the wire.
             log.error("Webhook event dispatch failed; row already recorded. eventId={} errorClass={}",
-                    eventId, e.getClass().getSimpleName(), e);
+                    envelope.id(), e.getClass().getSimpleName(), e);
             return ok();
         }
 
@@ -113,26 +148,52 @@ public class WebhookEventProcessor {
     }
 
     /**
-     * Build the typed event passed to handlers. Pulls
-     * {@code data.object} as the type-specific payload (handlers walk
-     * it themselves), and {@code event.created} (epoch second) as an
-     * {@link Instant} — falls back to {@code now} if Stripe omitted it
-     * (the webhook stream always includes it; this is defensive).
+     * Type-discrimination switch from wire envelope to typed
+     * {@link StripeEvent}. Unrecognised types (Stripe sends events for
+     * every subscribed type, including ones we don't consume) map to
+     * {@link StripeEvent.Ignored} — explicitly, as a first-class variant.
+     *
+     * <p><strong>Adding a new event type</strong> = one new case here +
+     * one new {@link StripeEvent} variant + one new dispatcher case (the
+     * dispatcher's switch is exhaustive; the build fails until the case
+     * is added).
      */
-    private static StripeWebhookEvent buildEvent(
-            String eventId,
-            String eventType,
-            JsonNode root,
-            Instant now
-    ) {
-        JsonNode dataObject = root.path("data").path("object");
-        if (dataObject.isMissingNode() || dataObject.isNull()) {
-            dataObject = MissingNode.getInstance();
+    static StripeEvent toStripeEvent(StripeEventEnvelope envelope, Instant fallbackOccurredAt) {
+        Instant occurredAt = envelope.created() > 0
+                ? Instant.ofEpochSecond(envelope.created())
+                : fallbackOccurredAt;
+        String type = envelope.type();
+
+        if (type == null) {
+            return new StripeEvent.Ignored(envelope.id(), occurredAt, null);
         }
-        Instant created = root.has("created") && root.get("created").isNumber()
-                ? Instant.ofEpochSecond(root.get("created").asLong())
-                : now;
-        return new StripeWebhookEvent(eventId, eventType, created, dataObject);
+
+        return switch (type) {
+            case EVENT_TYPE_PAYMENT_INTENT_SUCCEEDED -> {
+                if (envelope.data() == null || envelope.data().object() == null) {
+                    // Wire shape claims a typed event but data.object is
+                    // missing — the typed handler can't proceed without
+                    // a payload. Demote to Ignored + log so the
+                    // dispatcher acks Stripe (it would otherwise retry
+                    // forever) and we have a forensics trace.
+                    log.warn("Wire envelope claims {} but data.object is missing; demoting to Ignored. eventId={}",
+                            EVENT_TYPE_PAYMENT_INTENT_SUCCEEDED, envelope.id());
+                    yield new StripeEvent.Ignored(envelope.id(), occurredAt, type);
+                }
+                yield new StripeEvent.PaymentIntentSucceeded(
+                        envelope.id(), occurredAt, envelope.data().object());
+            }
+            case EVENT_TYPE_PAYMENT_INTENT_FAILED -> {
+                if (envelope.data() == null || envelope.data().object() == null) {
+                    log.warn("Wire envelope claims {} but data.object is missing; demoting to Ignored. eventId={}",
+                            EVENT_TYPE_PAYMENT_INTENT_FAILED, envelope.id());
+                    yield new StripeEvent.Ignored(envelope.id(), occurredAt, type);
+                }
+                yield new StripeEvent.PaymentIntentFailed(
+                        envelope.id(), occurredAt, envelope.data().object());
+            }
+            default -> new StripeEvent.Ignored(envelope.id(), occurredAt, type);
+        };
     }
 
     private static APIGatewayV2HTTPResponse ok() {
@@ -161,13 +222,5 @@ public class WebhookEventProcessor {
             }
         }
         return null;
-    }
-
-    private static String textOrNull(JsonNode root, String field) {
-        if (root == null || !root.has(field)) {
-            return null;
-        }
-        JsonNode node = root.get(field);
-        return node.isTextual() ? node.asText() : null;
     }
 }

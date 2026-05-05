@@ -1,7 +1,5 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.functorful.stripewebhook.dispatch.EventHandler;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
@@ -9,13 +7,12 @@ import com.functorful.stripewebhook.dynamodb.PaymentView;
 import com.functorful.stripewebhook.dynamodb.ReservationView;
 import com.functorful.stripewebhook.dynamodb.UserInvestmentStore;
 import com.functorful.stripewebhook.email.SesEmailService;
-import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.event.PaymentIntentObject;
+import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
-import io.micronaut.context.annotation.Bean;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.tracing.annotation.NewSpan;
-import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -45,7 +42,7 @@ import java.util.Optional;
  * </ol>
  *
  * <p><strong>Status-guard posture:</strong> guard violations log + return
- * 200 (do NOT throw — the WebhookEvent row is already recorded; we don't
+ * (do NOT throw — the WebhookEvent row is already recorded; we don't
  * want Stripe retrying a poison pill, and we don't want a 5xx leaking to
  * the wire). Real bugs (transient DDB, IAM regressions) propagate via a
  * non-{@link TransactionCanceledException}; the orchestrator's outer catch
@@ -55,12 +52,16 @@ import java.util.Optional;
  * by {@code WebhookEvent.eventId} (PAY-02). Within the handler, the
  * {@code attribute_not_exists(userId)} on the UserInvestment put gives a
  * second-line defense for the partial-write recovery path (§6).
+ *
+ * <p><strong>ADR-0008 typed-event contract.</strong> This handler takes
+ * a {@link StripeEvent.PaymentIntentSucceeded} — the dispatcher's switch
+ * routes here only after the boundary parser has produced a fully-typed
+ * {@link PaymentIntentObject}. No {@code JsonNode} traversal at this
+ * layer.
  */
 @Slf4j
 @Singleton
-@Bean
-@Named("payment_intent.succeeded")
-public class PaymentIntentSucceededHandler implements EventHandler {
+public class PaymentIntentSucceededHandler {
 
     /** Status-transition matrix expectations (per ARCH-04 / resource.ts). */
     private static final String RESERVATION_EXPECTED = "confirmed";
@@ -138,9 +139,8 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         }
     }
 
-    @Override
     @NewSpan
-    public void handle(StripeWebhookEvent event) {
+    public void handle(StripeEvent.PaymentIntentSucceeded event) {
         // Tomás M-NEW-1 (infrastructure!14): when the AuditLog SSM bridge
         // is not yet ready, AUDIT_LOG_TABLE_NAME collapses to the
         // sentinel. Short-circuit BEFORE the TWI so we never run a
@@ -150,8 +150,8 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         if (degradedMode) {
             log.error("PAY-05 handler in {} — AuditLog SSM bridge not ready. Skipping ALL writes; "
                             + "webhook event recorded for replay after var.audit_log_ssm_bridge_ready "
-                            + "flips and the Lambda image rolls. eventId={} eventType={}",
-                    DEGRADED_MODE_CANARY, event.eventId(), event.eventType());
+                            + "flips and the Lambda image rolls. eventId={} eventType=payment_intent.succeeded",
+                    DEGRADED_MODE_CANARY, event.eventId());
             // Do NOT call markProcessed. Row stays processed=false so the
             // M3 alarm fires (the partial-coverage log-metric-filter
             // pattern includes "DEGRADED MODE" as a canary string).
@@ -160,11 +160,13 @@ public class PaymentIntentSucceededHandler implements EventHandler {
 
         Instant receivedAt = Instant.now();
 
-        // 1. Extract paymentIntentId + reservation key from event payload.
-        JsonNode dataObject = event.dataObject();
-        String paymentIntentId = textOrEmpty(dataObject, "id");
-        if (paymentIntentId.isEmpty()) {
-            // Tomás §10 M4 case 16: defensive — log + return.
+        // 1. Extract paymentIntentId + reservation key from typed event payload.
+        PaymentIntentObject payload = event.payload();
+        String paymentIntentId = payload.id();
+        if (paymentIntentId == null || paymentIntentId.isEmpty()) {
+            // Tomás §10 M4 case 16: defensive — log + return. The
+            // boundary parser requires PaymentIntentObject.id, so this
+            // branch is unreachable in practice. Belt-and-braces.
             log.warn("payment_intent.succeeded event missing data.object.id; skipping. eventId={}",
                     event.eventId());
             return;
@@ -172,7 +174,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
 
         ReservationKey reservationKey;
         try {
-            reservationKey = ReservationKey.fromStripeMetadata(dataObject.get("metadata"));
+            reservationKey = ReservationKey.fromStripeMetadata(payload.metadataOrEmpty());
         } catch (IllegalArgumentException e) {
             log.warn("payment_intent.succeeded event has incomplete metadata; skipping. "
                             + "eventId={} missingField={}",
@@ -217,7 +219,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         Update updatePayment = paymentStore.buildStatusUpdate(
                 payment.id(), payment.version(),
                 PAYMENT_EXPECTED, PAYMENT_TARGET,
-                event.created(), null);
+                event.occurredAt(), null);
         Update updateReservation = reservationStore.buildStatusUpdate(
                 reservationKey, RESERVATION_EXPECTED, RESERVATION_TARGET, now);
         Put putUserInvestment = userInvestmentStore.buildIdempotentPut(
@@ -235,7 +237,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
                 /* reservationTransition */ RESERVATION_EXPECTED + " -> " + RESERVATION_TARGET);
         Put putAuditLog = auditLogStore.buildPut(new AuditLogStore.Entry(
                 payment.userId(),
-                event.created(),
+                event.occurredAt(),
                 AUDIT_RESOURCE_PREFIX + reservationFingerprint(reservationKey),
                 AUDIT_ACTION_SUCCEEDED,
                 details));
@@ -264,7 +266,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
         }
 
         // 5. SES confirmation email — best-effort.
-        String receiptEmail = textOrEmpty(dataObject, "receipt_email");
+        String receiptEmail = payload.receiptEmailOrEmpty();
         if (!receiptEmail.isEmpty()) {
             sesEmailService.sendPaymentConfirmation(
                     receiptEmail,
@@ -302,7 +304,7 @@ public class PaymentIntentSucceededHandler implements EventHandler {
      * map shape and emits the corresponding nested JSON.
      */
     private Map<String, Object> buildAuditDetails(
-            StripeWebhookEvent event,
+            StripeEvent.PaymentIntentSucceeded event,
             String paymentIntentId,
             PaymentView payment,
             ReservationKey reservationKey,
@@ -347,10 +349,5 @@ public class PaymentIntentSucceededHandler implements EventHandler {
     private static String reservationFingerprint(ReservationKey key) {
         return key.userId() + "|" + key.investmentId() + "#" + key.investmentVersion()
                 + "@" + key.requestedAt() + "/v" + key.version();
-    }
-
-    private static String textOrEmpty(JsonNode root, String field) {
-        JsonNode node = root == null ? null : root.get(field);
-        return node == null || !node.isTextual() ? "" : node.asText();
     }
 }
