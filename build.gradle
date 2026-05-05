@@ -62,7 +62,6 @@ dependencies {
         exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
     }
     implementation("software.amazon.awssdk:url-connection-client")
-    implementation("com.fasterxml.jackson.core:jackson-databind")
 
     implementation("io.vavr:vavr:0.11.0")
 

@@ -1,7 +1,5 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
@@ -9,7 +7,8 @@ import com.functorful.stripewebhook.dynamodb.PaymentView;
 import com.functorful.stripewebhook.dynamodb.ReservationView;
 import com.functorful.stripewebhook.dynamodb.UserInvestmentStore;
 import com.functorful.stripewebhook.email.SesEmailService;
-import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.event.PaymentIntentObject;
+import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,7 +22,9 @@ import software.amazon.awssdk.services.dynamodb.model.TransactionCanceledExcepti
 import software.amazon.awssdk.services.dynamodb.model.Update;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,6 +41,13 @@ import static org.mockito.Mockito.when;
  * the heart of PAY-05 §4.1 — verifies the success-path
  * {@code TransactWriteItems} is built with the four expected operations
  * and the guard-violation paths log + return without writing.
+ *
+ * <p>Post-ARCH-08: the handler takes a typed
+ * {@link StripeEvent.PaymentIntentSucceeded} (no JsonNode). Test fixtures
+ * build the typed payload directly via {@link PaymentIntentObject}; the
+ * metadata block is a {@code Map<String, String>} per Stripe's
+ * strings-only contract (see ADR-0008 §"Notes from review" for the
+ * production wire shape verification).
  */
 class PaymentIntentSucceededHandlerTest {
 
@@ -114,7 +122,7 @@ class PaymentIntentSucceededHandlerTest {
         when(paymentStore.findByReservationAndIntent(any(), eq(PAYMENT_INTENT_ID)))
                 .thenReturn(Optional.of(payment));
 
-        StripeWebhookEvent event = newEvent("investor@example.com");
+        StripeEvent.PaymentIntentSucceeded event = newEvent("investor@example.com");
 
         handler.handle(event);
 
@@ -275,15 +283,16 @@ class PaymentIntentSucceededHandlerTest {
     }
 
     // ------------------------------------------------------------
-    // Case 16 (design §8, Tomás §10 M4): event missing data.object.id
+    // Case 16 (design §8, Tomás §10 M4): event missing data.object.id.
+    // Defensive: in production this can't happen — Serde requires the
+    // PaymentIntentObject.id field — but the handler still defends.
     // ------------------------------------------------------------
     @Test
     void missingPaymentIntentId_logsAndSkipsWithoutWrite() {
-        StripeWebhookEvent eventNoId = new StripeWebhookEvent(
+        StripeEvent.PaymentIntentSucceeded eventNoId = new StripeEvent.PaymentIntentSucceeded(
                 EVENT_ID,
-                "payment_intent.succeeded",
                 EVENT_CREATED,
-                new ObjectMapper().createObjectNode() // empty data.object
+                new PaymentIntentObject("", null, Map.of(), null)
         );
 
         handler.handle(eventNoId);
@@ -349,22 +358,26 @@ class PaymentIntentSucceededHandlerTest {
 
     // --- helpers ---
 
-    private static StripeWebhookEvent newEvent(String receiptEmail) {
-        ObjectMapper mapper = new ObjectMapper();
-        com.fasterxml.jackson.databind.node.ObjectNode dataObject = mapper.createObjectNode();
-        dataObject.put("id", PAYMENT_INTENT_ID);
-        if (receiptEmail != null) {
-            dataObject.put("receipt_email", receiptEmail);
-        }
-        com.fasterxml.jackson.databind.node.ObjectNode metadata = dataObject.putObject("metadata");
+    private static StripeEvent.PaymentIntentSucceeded newEvent(String receiptEmail) {
+        // ADR-0008 "Notes from review": metadata is a Map<String, String>.
+        // Numeric fields go in via Long.toString(...) — this matches
+        // PaymentLambda's stripeMetadata helper exactly. Pre-ARCH-08
+        // versions of these fixtures used ObjectNode.put(String, long)
+        // which produced JSON numerics; the dual-shape parsing branch in
+        // ReservationKey existed for those tests and is gone now.
+        Map<String, String> metadata = new LinkedHashMap<>();
         metadata.put("reservationUserId", USER_ID);
         metadata.put("reservationInvestmentId", INVESTMENT_ID);
-        metadata.put("reservationInvestmentVersion", INVESTMENT_VERSION);
+        metadata.put("reservationInvestmentVersion", Long.toString(INVESTMENT_VERSION));
         metadata.put("reservationRequestedAt", REQUESTED_AT);
-        metadata.put("reservationVersion", RESERVATION_VERSION);
+        metadata.put("reservationVersion", Long.toString(RESERVATION_VERSION));
 
-        JsonNode dataObjectNode = dataObject;
-        return new StripeWebhookEvent(EVENT_ID, "payment_intent.succeeded",
-                EVENT_CREATED, dataObjectNode);
+        PaymentIntentObject payload = new PaymentIntentObject(
+                PAYMENT_INTENT_ID,
+                receiptEmail,
+                metadata,
+                null
+        );
+        return new StripeEvent.PaymentIntentSucceeded(EVENT_ID, EVENT_CREATED, payload);
     }
 }

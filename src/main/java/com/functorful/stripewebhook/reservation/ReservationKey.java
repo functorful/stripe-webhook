@@ -1,7 +1,6 @@
 package com.functorful.stripewebhook.reservation;
 
-import com.fasterxml.jackson.databind.JsonNode;
-
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -41,9 +40,9 @@ public record ReservationKey(
     }
 
     /**
-     * Parse from the Stripe PaymentIntent's {@code metadata} block.
-     * The keys are the ones PaymentLambda's {@code stripeMetadata}
-     * helper writes:
+     * Parse from the Stripe PaymentIntent's {@code metadata} block. The
+     * keys are the ones PaymentLambda's {@code stripeMetadata} helper
+     * writes:
      *
      * <ul>
      *   <li>{@code reservationUserId}</li>
@@ -53,14 +52,27 @@ public record ReservationKey(
      *   <li>{@code reservationVersion}</li>
      * </ul>
      *
+     * <p>Stripe's metadata API contract is strings-only — every value on
+     * the wire is a String — so this signature accepts only
+     * {@code Map<String, String>}. PaymentLambda writes numeric fields
+     * via {@code Long.toString(...)}; the parse here calls
+     * {@code Long.parseLong(...)} on those entries.
+     *
+     * <p>Pre-ADR-0008 versions of this method also accepted a
+     * {@code JsonNode} and tolerated numeric-shape values (a leniency
+     * needed only by tests using {@code ObjectNode.put(String, long)} —
+     * never by production traffic). That overload is removed; tests pass
+     * {@code Long.toString(...)} now.
+     *
      * @return parsed {@link ReservationKey}; never {@code null}.
-     * @throws IllegalArgumentException if any required field is missing
-     *     or has the wrong type. The exception message contains the
-     *     field name only — never the value — so callers can safely
-     *     surface it (or log it) without leaking metadata.
+     * @throws IllegalArgumentException if any required field is missing,
+     *     empty, or non-numeric for the long-typed fields. The exception
+     *     message contains the field name only — never the value — so
+     *     callers can safely surface it (or log it) without leaking
+     *     metadata.
      */
-    public static ReservationKey fromStripeMetadata(JsonNode metadata) {
-        if (metadata == null || metadata.isMissingNode() || metadata.isNull()) {
+    public static ReservationKey fromStripeMetadata(Map<String, String> metadata) {
+        if (metadata == null || metadata.isEmpty()) {
             throw new IllegalArgumentException("metadata: missing");
         }
         return new ReservationKey(
@@ -72,29 +84,23 @@ public record ReservationKey(
         );
     }
 
-    private static String requireString(JsonNode metadata, String field) {
-        JsonNode node = metadata.get(field);
-        if (node == null || !node.isTextual() || node.asText().isEmpty()) {
+    private static String requireString(Map<String, String> metadata, String field) {
+        String value = metadata.get(field);
+        if (value == null || value.isEmpty()) {
             throw new IllegalArgumentException("metadata." + field);
         }
-        return node.asText();
+        return value;
     }
 
-    private static long requireLong(JsonNode metadata, String field) {
-        JsonNode node = metadata.get(field);
-        if (node == null) {
+    private static long requireLong(Map<String, String> metadata, String field) {
+        String value = metadata.get(field);
+        if (value == null || value.isEmpty()) {
             throw new IllegalArgumentException("metadata." + field);
         }
-        if (node.isNumber()) {
-            return node.asLong();
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("metadata." + field);
         }
-        if (node.isTextual()) {
-            try {
-                return Long.parseLong(node.asText());
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("metadata." + field);
-            }
-        }
-        throw new IllegalArgumentException("metadata." + field);
     }
 }

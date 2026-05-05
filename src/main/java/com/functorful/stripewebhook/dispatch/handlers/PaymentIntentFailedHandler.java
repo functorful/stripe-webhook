@@ -1,19 +1,16 @@
 package com.functorful.stripewebhook.dispatch.handlers;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.functorful.stripewebhook.dispatch.EventHandler;
 import com.functorful.stripewebhook.dynamodb.AuditLogStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentPaymentStore;
 import com.functorful.stripewebhook.dynamodb.InvestmentReservationStore;
 import com.functorful.stripewebhook.dynamodb.PaymentView;
 import com.functorful.stripewebhook.dynamodb.ReservationView;
-import com.functorful.stripewebhook.event.StripeWebhookEvent;
+import com.functorful.stripewebhook.event.PaymentIntentObject;
+import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
 import com.functorful.stripewebhook.reservation.ReservationKey;
-import io.micronaut.context.annotation.Bean;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.tracing.annotation.NewSpan;
-import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -56,12 +53,16 @@ import java.util.regex.Pattern;
  * {@code lastPaymentError.code} (categorised — {@code card_declined},
  * {@code insufficient_funds}, etc.); the raw message stays out of
  * CloudWatch.
+ *
+ * <p><strong>ADR-0008 typed-event contract.</strong> This handler takes
+ * a {@link StripeEvent.PaymentIntentFailed} — the dispatcher's switch
+ * routes here only after the boundary parser has produced a fully-typed
+ * {@link PaymentIntentObject}. No {@code JsonNode} traversal at this
+ * layer.
  */
 @Slf4j
 @Singleton
-@Bean
-@Named("payment_intent.payment_failed")
-public class PaymentIntentFailedHandler implements EventHandler {
+public class PaymentIntentFailedHandler {
 
     static final int MAX_ERROR_MESSAGE_LENGTH = 500;
     private static final Pattern CONTROL_CHARS = Pattern.compile("[\\x00-\\x1F\\x7F]");
@@ -117,39 +118,37 @@ public class PaymentIntentFailedHandler implements EventHandler {
         }
     }
 
-    @Override
     @NewSpan
-    public void handle(StripeWebhookEvent event) {
+    public void handle(StripeEvent.PaymentIntentFailed event) {
         // Tomás M-NEW-1 (infrastructure!14): degraded-mode short-circuit
         // when the AuditLog SSM bridge is not yet ready. See
         // PaymentIntentSucceededHandler.handle() for the full rationale.
         if (degradedMode) {
             log.error("PAY-05 handler in {} — AuditLog SSM bridge not ready. Skipping ALL writes; "
                             + "webhook event recorded for replay after var.audit_log_ssm_bridge_ready "
-                            + "flips and the Lambda image rolls. eventId={} eventType={}",
-                    DEGRADED_MODE_CANARY, event.eventId(), event.eventType());
+                            + "flips and the Lambda image rolls. eventId={} eventType=payment_intent.payment_failed",
+                    DEGRADED_MODE_CANARY, event.eventId());
             return;
         }
 
         Instant receivedAt = Instant.now();
 
-        JsonNode dataObject = event.dataObject();
-        String paymentIntentId = textOrEmpty(dataObject, "id");
-        if (paymentIntentId.isEmpty()) {
+        PaymentIntentObject payload = event.payload();
+        String paymentIntentId = payload.id();
+        if (paymentIntentId == null || paymentIntentId.isEmpty()) {
             log.warn("payment_intent.payment_failed event missing data.object.id; skipping. eventId={}",
                     event.eventId());
             return;
         }
 
         // Tomás §10 M1: sanitize before persist; log only the code, not the message.
-        JsonNode lastPaymentErrorNode = dataObject.path("last_payment_error");
-        String lastPaymentErrorCode = textOrEmpty(lastPaymentErrorNode, "code");
-        String rawMessage = textOrEmpty(lastPaymentErrorNode, "message");
+        String lastPaymentErrorCode = payload.lastPaymentErrorCodeOrEmpty();
+        String rawMessage = payload.lastPaymentErrorMessageOrEmpty();
         String sanitizedMessage = sanitizeErrorMessage(rawMessage);
 
         ReservationKey reservationKey;
         try {
-            reservationKey = ReservationKey.fromStripeMetadata(dataObject.get("metadata"));
+            reservationKey = ReservationKey.fromStripeMetadata(payload.metadataOrEmpty());
         } catch (IllegalArgumentException e) {
             log.warn("payment_intent.payment_failed event has incomplete metadata; skipping. "
                             + "eventId={} missingField={}",
@@ -187,7 +186,7 @@ public class PaymentIntentFailedHandler implements EventHandler {
         }
 
         // Branch reservation target on per-method window.
-        String reservationTarget = isPastExpiry(reservation, event.created())
+        String reservationTarget = isPastExpiry(reservation, event.occurredAt())
                 ? RESERVATION_TARGET_EXPIRED
                 : RESERVATION_TARGET_RETRY;
 
@@ -209,7 +208,7 @@ public class PaymentIntentFailedHandler implements EventHandler {
                 RESERVATION_EXPECTED + " -> " + reservationTarget);
         Put putAuditLog = auditLogStore.buildPut(new AuditLogStore.Entry(
                 payment.userId(),
-                event.created(),
+                event.occurredAt(),
                 AUDIT_RESOURCE_PREFIX + reservationFingerprint(reservationKey),
                 AUDIT_ACTION_FAILED,
                 details));
@@ -288,13 +287,13 @@ public class PaymentIntentFailedHandler implements EventHandler {
     /**
      * Build the AuditLog `details` payload as a {@link LinkedHashMap}
      * for stable insertion-order serialisation. See
-     * {@link PaymentIntentSucceededHandler#buildAuditDetails} for the
+     * {@link PaymentIntentSucceededHandler}'s buildAuditDetails for the
      * shared field contract; this variant adds
      * {@code lastPaymentErrorCode} / {@code lastPaymentError} on
      * non-empty inputs.
      */
     private Map<String, Object> buildAuditDetails(
-            StripeWebhookEvent event,
+            StripeEvent.PaymentIntentFailed event,
             String paymentIntentId,
             PaymentView payment,
             ReservationKey reservationKey,
@@ -339,10 +338,5 @@ public class PaymentIntentFailedHandler implements EventHandler {
     private static String reservationFingerprint(ReservationKey key) {
         return key.userId() + "|" + key.investmentId() + "#" + key.investmentVersion()
                 + "@" + key.requestedAt() + "/v" + key.version();
-    }
-
-    private static String textOrEmpty(JsonNode root, String field) {
-        JsonNode node = root == null ? null : root.get(field);
-        return node == null || !node.isTextual() ? "" : node.asText();
     }
 }
