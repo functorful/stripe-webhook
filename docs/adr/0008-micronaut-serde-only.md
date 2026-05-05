@@ -132,17 +132,21 @@ visibility.
 
 ### Concrete changes (follow-up MR)
 2. **CI static check** in `.github/workflows/build.yml` — a new step that runs before
-   `./gradlew build`, fail-fast on match:
+   `./gradlew build`, fail-fast on match. **Important: pattern is `com.fasterxml.jackson`
+   without the `import` prefix** — fully-qualified-name uses
+   (`new com.fasterxml.jackson.databind.ObjectMapper()`, parameter types declared inline)
+   are legal Java and would bypass an `import`-anchored grep. The unanchored pattern
+   matches both:
    ```yaml
-   - name: Static check — no direct Jackson imports in production code
+   - name: Static check — no direct Jackson use in production code
      run: |
-       OFFENDERS=$(find src/main -name "*.java" -exec grep -l "import com\.fasterxml\.jackson" {} + || true)
+       OFFENDERS=$(find src/main -name "*.java" -exec grep -l "com\.fasterxml\.jackson" {} + || true)
        if [ -n "$OFFENDERS" ]; then
-         echo "::error::Direct Jackson imports found in production code (forbidden — see ADR-0008):"
+         echo "::error::Direct Jackson references found in production code (forbidden — see ADR-0008):"
          echo "$OFFENDERS"
          exit 1
        fi
-       echo "✓ No direct Jackson imports in production code."
+       echo "✓ No direct Jackson references in production code."
    ```
    The check lives **before** the gradle build so it fails inside seconds rather than
    waiting for the full native-image compile.
@@ -228,11 +232,24 @@ Tomás flagged three concerns when ARCH-08 was queued:
 ## Verification
 
 - `./gradlew test` green after the migration.
-- `find src/main -name "*.java" -exec grep -l "import com.fasterxml.jackson" {} +` returns
-  empty in CI.
+- `find src/main -name "*.java" -exec grep -l "com.fasterxml.jackson" {} +` returns
+  empty in CI (unanchored pattern catches FQN bypasses too — see §"Concrete changes").
 - `./gradlew dependencies | grep jackson-databind` shows only the transitive path through
   `io.micronaut.serde:micronaut-serde-jackson`, never a direct
   `--- com.fasterxml.jackson.core:jackson-databind` at depth 1.
+
+## Notes from review
+
+- **`ReservationKey.fromStripeMetadata` dual-shape parsing** (current `requireLong`
+  accepts both `JsonNode.isNumber()` and `JsonNode.isTextual()` paths) — investigated
+  during ADR review. PaymentLambda's `stripeMetadata` helper writes every field as a
+  `String` via `Long.toString(...)` (`backend/payment-lambda/CreatePaymentIntentProcessor.java`).
+  Stripe API contract is metadata-values-are-always-strings. The defensive numeric branch
+  exists purely for test ergonomics: `PaymentIntentSucceededHandlerTest` uses
+  `ObjectNode.put(String, long)` which produces a JSON numeric node. **Migration PR
+  drops the numeric branch in production code AND updates the test fixtures to
+  `Long.toString(...)` to match the production wire shape.** Documented here for the
+  contract change and for future history.
 
 ## Follow-ups
 
