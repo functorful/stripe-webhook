@@ -2,6 +2,7 @@ package com.functorful.stripewebhook;
 
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
+import com.functorful.stripewebhook.audit.WebhookPayloadAuditWriter;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
 import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.event.wire.StripeEventEnvelope;
@@ -72,6 +73,7 @@ public class WebhookEventProcessor {
     private final WebhookEventDispatcher dispatcher;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final WebhookPayloadAuditWriter auditWriter;
 
     public WebhookEventProcessor(
             StripeSignatureVerifier signatureVerifier,
@@ -79,7 +81,8 @@ public class WebhookEventProcessor {
             WebhookIdempotencyStore idempotencyStore,
             WebhookEventDispatcher dispatcher,
             ObjectMapper objectMapper,
-            Clock clock
+            Clock clock,
+            WebhookPayloadAuditWriter auditWriter
     ) {
         this.signatureVerifier = signatureVerifier;
         this.signingSecret = signingSecret;
@@ -87,6 +90,7 @@ public class WebhookEventProcessor {
         this.dispatcher = dispatcher;
         this.objectMapper = objectMapper;
         this.clock = clock;
+        this.auditWriter = auditWriter;
     }
 
     /**
@@ -96,9 +100,9 @@ public class WebhookEventProcessor {
     @NewSpan
     public APIGatewayV2HTTPResponse process(APIGatewayV2HTTPEvent input) {
         String rawBody = input.getBody() == null ? "" : input.getBody();
+        String signatureHeader = readHeaderCaseInsensitive(input, STRIPE_SIGNATURE_HEADER);
 
         try {
-            String signatureHeader = readHeaderCaseInsensitive(input, STRIPE_SIGNATURE_HEADER);
             // Tomás veto: do NOT echo rawBody in the failure log path.
             // The exception message is parameterised and contains only
             // the failure category, never body content.
@@ -107,6 +111,14 @@ public class WebhookEventProcessor {
             log.warn("Stripe webhook signature verification failed. reason={}", e.getMessage());
             return badRequest();
         }
+
+        // PAY-08: persist the verified raw payload to the Object-Lock
+        // audit-log bucket BEFORE JSON parse / idempotency check / dispatch.
+        // Three properties anchor this insertion point: trusted bytes only,
+        // forensics-complete (even payloads that subsequently fail Serde
+        // parse are audited), and parser-independent (no event-id needed
+        // for the object key). See WebhookPayloadAuditWriter Javadoc.
+        auditWriter.recordVerifiedPayload(rawBody, signatureHeader, requestIdOf(input));
 
         StripeEventEnvelope envelope;
         try {
@@ -233,5 +245,25 @@ public class WebhookEventProcessor {
             }
         }
         return null;
+    }
+
+    /**
+     * Extract the API Gateway HTTP request id from the inbound event.
+     * Preferred over the Lambda invocation id (which would require
+     * threading {@code com.amazonaws.services.lambda.runtime.Context}
+     * through {@code FunctionRequestHandler.execute}) because it is the
+     * canonical "this HTTP request" identifier — API Gateway access logs
+     * key on the same value, so forensic correlation across the audit
+     * object metadata, CloudWatch logs, and the API Gateway access log
+     * is a literal id-equals join. Returns empty string (never null) if
+     * the request context is structurally absent (defensive — should
+     * never happen in production traffic).
+     */
+    private static String requestIdOf(APIGatewayV2HTTPEvent input) {
+        if (input.getRequestContext() == null) {
+            return "";
+        }
+        String requestId = input.getRequestContext().getRequestId();
+        return requestId == null ? "" : requestId;
     }
 }

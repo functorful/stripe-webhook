@@ -107,7 +107,12 @@ class SecretsManagerClientFactoryReplacesTest {
                 .properties(Map.of(
                         "stripe.webhook.signing-secret-arn",
                         "arn:aws:secretsmanager:eu-west-1:000000000000:secret:test/placeholder",
-                        "webhook-events.table-name", "WebhookEvent-placeholder"
+                        "webhook-events.table-name", "WebhookEvent-placeholder",
+                        // PAY-08 — fail-closed at cold start if the audit-log
+                        // bucket isn't configured (WebhookPayloadAuditProperties
+                        // @PostConstruct). Provide a placeholder so the
+                        // context boots cleanly in this regression test.
+                        "webhook-payload-audit.bucket-name", "webhook-payload-audit-placeholder"
                 ))
                 .start();
     }
