@@ -2,6 +2,7 @@ package com.functorful.stripewebhook;
 
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;
+import com.functorful.stripewebhook.audit.WebhookPayloadAuditWriter;
 import com.functorful.stripewebhook.dispatch.WebhookEventDispatcher;
 import com.functorful.stripewebhook.event.StripeEvent;
 import com.functorful.stripewebhook.idempotency.WebhookIdempotencyStore;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -33,6 +35,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -90,6 +93,8 @@ class WebhookEventProcessorTest {
     WebhookIdempotencyStore idempotencyStore;
     @Mock
     WebhookEventDispatcher dispatcher;
+    @Mock
+    WebhookPayloadAuditWriter auditWriter;
 
     StripeSignatureVerifier verifier;
     StripeWebhookSigningSecret signingSecret;
@@ -102,7 +107,7 @@ class WebhookEventProcessorTest {
         verifier = new StripeSignatureVerifier(fixedClock);
         signingSecret = new StripeWebhookSigningSecret(SECRET_VALUE, SECRET_ARN);
         processor = new WebhookEventProcessor(
-                verifier, signingSecret, idempotencyStore, dispatcher, objectMapper, fixedClock);
+                verifier, signingSecret, idempotencyStore, dispatcher, objectMapper, fixedClock, auditWriter);
     }
 
     @Test
@@ -184,6 +189,11 @@ class WebhookEventProcessorTest {
         assertThat(response.getBody()).isEqualTo("{\"error\":\"invalid request\"}");
         verify(idempotencyStore, never()).recordFirstDelivery(any(), any(), any());
         verify(dispatcher, never()).dispatch(any());
+        // PAY-08: an invalid signature MUST NOT trigger an audit-log
+        // write — pre-verify bytes are untrusted and an attacker could
+        // otherwise plant entries in the Object-Lock bucket without
+        // knowing the signing secret.
+        verify(auditWriter, never()).recordVerifiedPayload(any(), any(), any());
     }
 
     @Test
@@ -330,6 +340,78 @@ class WebhookEventProcessorTest {
         APIGatewayV2HTTPResponse response = processor.process(event);
 
         assertThat(response.getStatusCode()).isEqualTo(400);
+    }
+
+    @Test
+    void auditWriterCalledExactlyOnceBeforeJsonParseOnSignatureSuccess() {
+        // PAY-08 insertion-point invariant: the audit-log write happens
+        // AFTER signature verification (already covered by
+        // invalidSignatureReturns400WithGenericMessageAndDoesNotTouchDdb)
+        // and BEFORE the Serde parse / idempotency check / dispatch.
+        // InOrder asserts the call ordering across mocks.
+        when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
+                .thenReturn(RecordResult.FIRST_DELIVERY);
+
+        APIGatewayV2HTTPEvent event = httpEventWithBody(VALID_BODY,
+                buildSignatureHeader(FIXED_NOW_EPOCH, VALID_BODY, SECRET_VALUE));
+
+        processor.process(event);
+
+        InOrder ordered = inOrder(auditWriter, idempotencyStore, dispatcher);
+        ordered.verify(auditWriter, times(1))
+                .recordVerifiedPayload(eq(VALID_BODY), any(), any());
+        // The Serde parse is internal (ObjectMapper is the real bean, not
+        // a mock), so we assert ordering via the next mock interaction —
+        // idempotencyStore.recordFirstDelivery runs strictly after the
+        // parse, so its position in InOrder is a transitive proof that
+        // auditWriter ran before parse.
+        ordered.verify(idempotencyStore, times(1))
+                .recordFirstDelivery(eq(EVENT_ID), eq("stripe"), eq(FIXED_NOW));
+        ordered.verify(dispatcher, times(1)).dispatch(any());
+    }
+
+    @Test
+    void auditWriterCalledBeforeJsonParseEvenWhenParseSubsequentlyFails() {
+        // PAY-08 forensics-complete invariant: payloads that pass HMAC
+        // verification but subsequently fail Serde parse MUST still be
+        // audited. Without this, a parser regression would silently lose
+        // the forensic record of the very payloads that triggered it.
+        String hmacValidButMalformedJson = "this-is-not-json";
+        APIGatewayV2HTTPEvent event = httpEventWithBody(hmacValidButMalformedJson,
+                buildSignatureHeader(FIXED_NOW_EPOCH, hmacValidButMalformedJson, SECRET_VALUE));
+
+        APIGatewayV2HTTPResponse response = processor.process(event);
+
+        assertThat(response.getStatusCode()).isEqualTo(400);
+        verify(auditWriter, times(1))
+                .recordVerifiedPayload(eq(hmacValidButMalformedJson), any(), any());
+        verify(idempotencyStore, never()).recordFirstDelivery(any(), any(), any());
+        verify(dispatcher, never()).dispatch(any());
+    }
+
+    @Test
+    void auditWriterCalledBeforeIdempotencyCheckEvenOnReplay() {
+        // PAY-08 insertion-point invariant: the audit-log write happens
+        // BEFORE the idempotency check. Replays must still be audited —
+        // the bucket is a record of "every payload Stripe asked us to
+        // process and we trusted", which is parser- and idempotency-
+        // independent.
+        when(idempotencyStore.recordFirstDelivery(eq(EVENT_ID), eq("stripe"), any(Instant.class)))
+                .thenReturn(RecordResult.REPLAY);
+
+        APIGatewayV2HTTPEvent event = httpEventWithBody(VALID_BODY,
+                buildSignatureHeader(FIXED_NOW_EPOCH, VALID_BODY, SECRET_VALUE));
+
+        APIGatewayV2HTTPResponse response = processor.process(event);
+
+        assertThat(response.getStatusCode()).isEqualTo(200);
+        InOrder ordered = inOrder(auditWriter, idempotencyStore);
+        ordered.verify(auditWriter, times(1))
+                .recordVerifiedPayload(eq(VALID_BODY), any(), any());
+        ordered.verify(idempotencyStore, times(1))
+                .recordFirstDelivery(eq(EVENT_ID), eq("stripe"), eq(FIXED_NOW));
+        // Replay short-circuits before dispatch.
+        verify(dispatcher, never()).dispatch(any());
     }
 
     @Test

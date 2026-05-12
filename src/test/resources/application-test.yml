@@ -10,3 +10,6 @@ stripe:
 
 webhook-events:
   table-name: WebhookEvent-test
+
+webhook-payload-audit:
+  bucket-name: webhook-payload-audit-test

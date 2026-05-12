@@ -12,6 +12,15 @@ stripe:
 webhook-events:
   table-name: ${WEBHOOK_EVENTS_TABLE_NAME}
 
+# PAY-08 — Object-Lock GOVERNANCE+7y audit-log bucket for every
+# signature-verified webhook payload. Bound to the upper-case
+# WEBHOOK_PAYLOAD_AUDIT_BUCKET env var on the Lambda (set in
+# aws-stripe-webhook-lambda.tofu). No default — the audit-log is a
+# compliance / forensics requirement and must fail-closed at cold start
+# if unset; WebhookPayloadAuditProperties throws on a blank value.
+webhook-payload-audit:
+  bucket-name: ${WEBHOOK_PAYLOAD_AUDIT_BUCKET}
+
 # Build provenance — bound to the Datadog-convention env vars the
 # Dockerfile already sets (see build.gradle's `dockerEnv()` block).
 # Decoupled from the `dd.*` namespace so the application code reads

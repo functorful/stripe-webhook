@@ -61,6 +61,15 @@ dependencies {
         exclude(group: "software.amazon.awssdk", module: "apache-client")
         exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
     }
+    // PAY-08 — webhook payload audit log writer. Every signature-verified
+    // payload is persisted to an Object-Lock GOVERNANCE+7y bucket immediately
+    // after HMAC verification, before JSON parse. URL-connection HTTP client
+    // is consistent with the rest of this Lambda (smaller native image,
+    // faster cold start).
+    implementation("software.amazon.awssdk:s3") {
+        exclude(group: "software.amazon.awssdk", module: "apache-client")
+        exclude(group: "software.amazon.awssdk", module: "netty-nio-client")
+    }
     implementation("software.amazon.awssdk:url-connection-client")
 
     implementation("io.vavr:vavr:0.11.0")
