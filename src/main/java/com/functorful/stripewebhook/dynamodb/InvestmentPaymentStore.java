@@ -28,13 +28,16 @@ import java.util.Optional;
  * the FK Query + filter path. Both shapes are correct; the FK Query
  * is just a couple of RCUs more per call.
  *
- * <p><strong>GSI name override:</strong> Amplify Gen-2 generates GSIs
- * for {@code belongsTo} relations with a stable but verbose name. The
- * index name is bound through {@link InvestmentPaymentProperties}
- * (default {@code "investmentPaymentByReservation"}) so operators can
- * adjust without a code deploy if the Amplify-generated name diverges
- * from the default. A smoke-test failure on this lookup is recoverable
- * by re-pointing the env var.
+ * <p><strong>GSI name override:</strong> Amplify Gen 2 generates GSIs
+ * for {@code belongsTo} relations using the
+ * {@code gsi-<ParentModel>.<relationshipField>} convention. The index
+ * name is bound through {@link InvestmentPaymentProperties} (default
+ * {@code "gsi-InvestmentReservation.payments"}) so operators can adjust
+ * without a code deploy if the Amplify-generated name diverges in a
+ * future codegen change. A smoke-test failure on this lookup is
+ * recoverable by re-pointing the env var; see infrastructure MR !51 +
+ * HYG-19 axis-4 anchor for the prior cycle in which this lookup name
+ * was empirically wrong against deployed reality.
  *
  * <p>Schema fields surfaced (all read-only on lookup):
  * id, version, userId, amountCents, currency, stripePaymentIntentId,
